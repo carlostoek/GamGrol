@@ -14,6 +14,7 @@ from sqlalchemy.orm import declarative_base, sessionmaker
 
 # Configuración de logging
 logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 # Cargar variables de entorno
 load_dotenv()
@@ -57,13 +58,12 @@ class Reward(Base):
     stock = Column(Integer, default=1)
 
 # Configuración de la base de datos
-engine = create_async_engine(DATABASE_URL, echo=True)
+engine = create_async_engine(DATABASE_URL, echo=False)  # Desactivar logs SQL
 async_session = sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
 
 async def init_db():
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
-    # Crear misiones y recompensas iniciales
     async with async_session() as session:
         missions = [
             Mission(title="Trivia Diaria", description="Responde la trivia del día", points=10, type="daily"),
@@ -85,7 +85,13 @@ async def init_db():
 
 async def get_db():
     async with async_session() as session:
-        yield session
+        try:
+            yield session
+            await session.commit()
+        except Exception as e:
+            logger.error(f"Error en la base de datos: {e}")
+            await session.rollback()
+            raise
 
 # Lógica de gamificación
 async def award_points(user: User, points: int, session: AsyncSession):
@@ -121,19 +127,26 @@ main_menu = ReplyKeyboardMarkup(
 # Handlers
 @router.message(Command("start"))
 async def cmd_start(message: Message):
+    logger.info(f"Procesando /start para usuario {message.from_user.id}")
     async for session in get_db():
-        user = await session.get(User, message.from_user.id)
-        if not user:
-            user = User(telegram_id=message.from_user.id, username=message.from_user.username)
-            session.add(user)
-            await session.commit()
-        await message.answer(
-            "¡Bienvenido al bot gamificado! 🎮\nUsa el menú para navegar.",
-            reply_markup=main_menu
-        )
+        try:
+            user = await session.get(User, message.from_user.id)
+            if not user:
+                user = User(telegram_id=message.from_user.id, username=message.from_user.username)
+                session.add(user)
+                await session.commit()
+                logger.info(f"Usuario {message.from_user.id} creado")
+            await message.answer(
+                "¡Bienvenido al bot gamificado! 🎮\nUsa el menú para navegar.",
+                reply_markup=main_menu
+            )
+        except Exception as e:
+            logger.error(f"Error en /start: {e}")
+            await message.answer("Ocurrió un error. Intenta de nuevo.")
 
 @router.message(F.text == "Perfil")
 async def cmd_profile(message: Message):
+    logger.info(f"Procesando Perfil para usuario {message.from_user.id}")
     async for session in get_db():
         user = await session.get(User, message.from_user.id)
         if user:
@@ -152,6 +165,7 @@ async def cmd_profile(message: Message):
 
 @router.message(F.text == "Misiones")
 async def show_missions(message: Message):
+    logger.info(f"Procesando Misiones para usuario {message.from_user.id}")
     async for session in get_db():
         missions = await session.execute(select(Mission).filter_by(active=1))
         missions = missions.scalars().all()
@@ -163,6 +177,7 @@ async def show_missions(message: Message):
 
 @router.callback_query(F.data.startswith("mission_"))
 async def handle_mission(callback: CallbackQuery):
+    logger.info(f"Procesando misión para usuario {callback.from_user.id}")
     mission_id = int(callback.data.split("_")[1])
     async for session in get_db():
         mission = await session.get(Mission, mission_id)
@@ -184,6 +199,7 @@ async def handle_mission(callback: CallbackQuery):
 
 @router.message(F.text == "Tienda")
 async def show_store(message: Message):
+    logger.info(f"Procesando Tienda para usuario {message.from_user.id}")
     async for session in get_db():
         rewards = await session.execute(select(Reward).filter(Reward.stock > 0))
         rewards = rewards.scalars().all()
@@ -195,6 +211,7 @@ async def show_store(message: Message):
 
 @router.callback_query(F.data.startswith("reward_"))
 async def handle_reward(callback: CallbackQuery):
+    logger.info(f"Procesando recompensa para usuario {callback.from_user.id}")
     reward_id = int(callback.data.split("_")[1])
     async for session in get_db():
         reward = await session.get(Reward, reward_id)
@@ -213,6 +230,7 @@ async def handle_reward(callback: CallbackQuery):
 
 @router.message(F.text == "Ranking")
 async def show_ranking(message: Message):
+    logger.info(f"Procesando Ranking para usuario {message.from_user.id}")
     async for session in get_db():
         users = await session.execute(select(User).order_by(User.points.desc()).limit(10))
         users = users.scalars().all()
@@ -226,6 +244,7 @@ async def show_ranking(message: Message):
 
 @router.message(Command("exportar"))
 async def export_data(message: Message):
+    logger.info(f"Procesando /exportar para usuario {message.from_user.id}")
     if message.from_user.id != ADMIN_ID:
         await message.answer("No tienes permisos.")
         return
@@ -244,6 +263,7 @@ async def export_data(message: Message):
 
 @router.message(Command("resetear"))
 async def reset_season(message: Message):
+    logger.info(f"Procesando /resetear para usuario {message.from_user.id}")
     if message.from_user.id != ADMIN_ID:
         await message.answer("No tienes permisos.")
         return
@@ -254,6 +274,7 @@ async def reset_season(message: Message):
 
 @router.callback_query(F.data == "back_to_menu")
 async def back_to_menu(callback: CallbackQuery):
+    logger.info(f"Procesando back_to_menu para usuario {callback.from_user.id}")
     await callback.message.edit_text("Vuelve al menú:", reply_markup=main_menu)
     await callback.answer()
 
