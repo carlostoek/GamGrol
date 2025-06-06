@@ -119,13 +119,20 @@ main_menu = ReplyKeyboardMarkup(
     resize_keyboard=True
 )
 
+# Menú inline para "Volver al Menú"
+inline_main_menu = InlineKeyboardMarkup(inline_keyboard=[
+    [InlineKeyboardButton(text="Perfil", callback_data="menu_perfil")],
+    [InlineKeyboardButton(text="Misiones", callback_data="menu_misiones")],
+    [InlineKeyboardButton(text="Tienda", callback_data="menu_tienda")],
+    [InlineKeyboardButton(text="Ranking", callback_data="menu_ranking")]
+])
+
 # Handlers
 @router.message(Command("start"))
 async def cmd_start(message: Message):
     logger.info(f"Procesando /start para usuario {message.from_user.id}")
     async with async_session() as session:
         try:
-            # Verificar si el usuario ya existe
             user = await session.execute(select(User).filter_by(telegram_id=message.from_user.id))
             user = user.scalars().first()
             if not user:
@@ -138,7 +145,6 @@ async def cmd_start(message: Message):
                 reply_markup=main_menu
             )
         except IntegrityError:
-            # Ignorar error si el usuario ya existe
             await message.answer(
                 "¡Ya estás registrado! Usa el menú para navegar.",
                 reply_markup=main_menu
@@ -148,11 +154,13 @@ async def cmd_start(message: Message):
             await message.answer("Ocurrió un error al iniciar. Intenta de nuevo.")
 
 @router.message(F.text == "Perfil")
-async def cmd_profile(message: Message):
-    logger.info(f"Procesando Perfil para usuario {message.from_user.id}")
+@router.callback_query(F.data == "menu_perfil")
+async def cmd_profile(message: Message | CallbackQuery):
+    user_id = message.from_user.id if isinstance(message, Message) else message.from_user.id
+    logger.info(f"Procesando Perfil para usuario {user_id}")
     async with async_session() as session:
         try:
-            user = await session.execute(select(User).filter_by(telegram_id=message.from_user.id))
+            user = await session.execute(select(User).filter_by(telegram_id=user_id))
             user = user.scalars().first()
             if user:
                 profile_text = (
@@ -164,31 +172,61 @@ async def cmd_profile(message: Message):
                 keyboard = InlineKeyboardMarkup(inline_keyboard=[
                     [InlineKeyboardButton(text="Volver al Menú", callback_data="back_to_menu")]
                 ])
-                await message.answer(profile_text, reply_markup=keyboard)
+                if isinstance(message, Message):
+                    await message.answer(profile_text, reply_markup=keyboard)
+                else:
+                    await message.message.edit_text(profile_text, reply_markup=keyboard)
+                    await message.answer()
             else:
-                await message.answer("Por favor, usa /start primero.")
+                response = "Por favor, usa /start primero."
+                if isinstance(message, Message):
+                    await message.answer(response)
+                else:
+                    await message.message.answer(response)
+                    await message.answer()
         except Exception as e:
             logger.error(f"Error en Perfil: {e}")
-            await message.answer("Ocurrió un error al mostrar el perfil.")
+            response = "Ocurrió un error al mostrar el perfil."
+            if isinstance(message, Message):
+                await message.answer(response)
+            else:
+                await message.message.answer(response)
+                await message.answer()
 
 @router.message(F.text == "Misiones")
-async def show_missions(message: Message):
-    logger.info(f"Procesando Misiones para usuario {message.from_user.id}")
+@router.callback_query(F.data == "menu_misiones")
+async def show_missions(message: Message | CallbackQuery):
+    user_id = message.from_user.id if isinstance(message, Message) else message.from_user.id
+    logger.info(f"Procesando Misiones para usuario {user_id}")
     async with async_session() as session:
         try:
             missions = await session.execute(select(Mission).filter_by(active=1))
             missions = missions.scalars().all()
             if not missions:
-                await message.answer("No hay misiones disponibles.")
+                response = "No hay misiones disponibles."
+                if isinstance(message, Message):
+                    await message.answer(response)
+                else:
+                    await message.message.edit_text(response)
+                    await message.answer()
                 return
             keyboard = InlineKeyboardMarkup(inline_keyboard=[
                 [InlineKeyboardButton(text=mission.title, callback_data=f"mission_{mission.id}")]
                 for mission in missions
             ])
-            await message.answer("Misiones disponibles:", reply_markup=keyboard)
+            if isinstance(message, Message):
+                await message.answer("Misiones disponibles:", reply_markup=keyboard)
+            else:
+                await message.message.edit_text("Misiones disponibles:", reply_markup=keyboard)
+                await message.answer()
         except Exception as e:
             logger.error(f"Error en Misiones: {e}")
-            await message.answer("Ocurrió un error al mostrar misiones.")
+            response = "Ocurrió un error al mostrar misiones."
+            if isinstance(message, Message):
+                await message.answer(response)
+            else:
+                await message.message.answer(response)
+                await message.answer()
 
 @router.callback_query(F.data.startswith("mission_"))
 async def handle_mission(callback: CallbackQuery):
@@ -220,23 +258,39 @@ async def handle_mission(callback: CallbackQuery):
             await callback.message.answer("Ocurrió un error al completar la misión.")
 
 @router.message(F.text == "Tienda")
-async def show_store(message: Message):
-    logger.info(f"Procesando Tienda para usuario {message.from_user.id}")
+@router.callback_query(F.data == "menu_tienda")
+async def show_store(message: Message | CallbackQuery):
+    user_id = message.from_user.id if isinstance(message, Message) else message.from_user.id
+    logger.info(f"Procesando Tienda para usuario {user_id}")
     async with async_session() as session:
         try:
             rewards = await session.execute(select(Reward).filter(Reward.stock > 0))
             rewards = rewards.scalars().all()
             if not rewards:
-                await message.answer("No hay recompensas disponibles.")
+                response = "No hay recompensas disponibles."
+                if isinstance(message, Message):
+                    await message.answer(response)
+                else:
+                    await message.message.edit_text(response)
+                    await message.answer()
                 return
             keyboard = InlineKeyboardMarkup(inline_keyboard=[
                 [InlineKeyboardButton(text=f"{r.name} ({r.cost} pts)", callback_data=f"reward_{r.id}")]
                 for r in rewards
             ])
-            await message.answer("Tienda de recompensas:", reply_markup=keyboard)
+            if isinstance(message, Message):
+                await message.answer("Tienda de recompensas:", reply_markup=keyboard)
+            else:
+                await message.message.edit_text("Tienda de recompensas:", reply_markup=keyboard)
+                await message.answer()
         except Exception as e:
             logger.error(f"Error en Tienda: {e}")
-            await message.answer("Ocurrió un error al mostrar la tienda.")
+            response = "Ocurrió un error al mostrar la tienda."
+            if isinstance(message, Message):
+                await message.answer(response)
+            else:
+                await message.message.answer(response)
+                await message.answer()
 
 @router.callback_query(F.data.startswith("reward_"))
 async def handle_reward(callback: CallbackQuery):
@@ -263,8 +317,10 @@ async def handle_reward(callback: CallbackQuery):
             await callback.message.answer("Ocurrió un error al canjear la recompensa.")
 
 @router.message(F.text == "Ranking")
-async def show_ranking(message: Message):
-    logger.info(f"Procesando Ranking para usuario {message.from_user.id}")
+@router.callback_query(F.data == "menu_ranking")
+async def show_ranking(message: Message | CallbackQuery):
+    user_id = message.from_user.id if isinstance(message, Message) else message.from_user.id
+    logger.info(f"Procesando Ranking para usuario {user_id}")
     async with async_session() as session:
         try:
             users = await session.execute(select(User).order_by(User.points.desc()).limit(10))
@@ -275,10 +331,19 @@ async def show_ranking(message: Message):
             keyboard = InlineKeyboardMarkup(inline_keyboard=[
                 [InlineKeyboardButton(text="Volver al Menú", callback_data="back_to_menu")]
             ])
-            await message.answer(ranking_text, reply_markup=keyboard)
+            if isinstance(message, Message):
+                await message.answer(ranking_text, reply_markup=keyboard)
+            else:
+                await message.message.edit_text(ranking_text, reply_markup=keyboard)
+                await message.answer()
         except Exception as e:
             logger.error(f"Error en Ranking: {e}")
-            await message.answer("Ocurrió un error al mostrar el ranking.")
+            response = "Ocurrió un error al mostrar el ranking."
+            if isinstance(message, Message):
+                await message.answer(response)
+            else:
+                await message.message.answer(response)
+                await message.answer()
 
 @router.message(Command("exportar"))
 async def export_data(message: Message):
@@ -322,11 +387,12 @@ async def reset_season(message: Message):
 async def back_to_menu(callback: CallbackQuery):
     logger.info(f"Procesando back_to_menu para usuario {callback.from_user.id}")
     try:
-        await callback.message.edit_text("Vuelve al menú:", reply_markup=main_menu)
+        await callback.message.edit_text("Elige una opción:", reply_markup=inline_main_menu)
         await callback.answer()
     except Exception as e:
         logger.error(f"Error en back_to_menu: {e}")
         await callback.message.answer("Ocurrió un error al volver al menú.")
+        await callback.answer()
 
 # Inicialización y ejecución
 async def main():
