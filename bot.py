@@ -5,7 +5,7 @@ import csv
 import io
 from aiogram import Bot, Dispatcher, Router, F
 from aiogram.filters import Command
-from aiogram.types import Message, ReplyKeyboardMarkup, KeyboardButton, InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery
+from aiogram.types import Message, ReplyKeyboardMarkup, KeyboardButton, InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery, PollAnswer
 from aiogram.fsm.storage.memory import MemoryStorage
 from dotenv import load_dotenv
 from sqlalchemy import Column, Integer, String, JSON, select
@@ -21,6 +21,7 @@ logger = logging.getLogger(__name__)
 load_dotenv()
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 ADMIN_ID = int(os.getenv("ADMIN_ID", 123456789))
+CHANNEL_ID = int(os.getenv("CHANNEL_ID", -1001234567890))  # ID del canal VIP
 DATABASE_URL = os.getenv("DATABASE_URL", "sqlite+aiosqlite:///bot.db")
 
 # Inicializar bot y dispatcher
@@ -47,7 +48,9 @@ class Mission(Base):
     title = Column(String)
     description = Column(String)
     points = Column(Integer)
-    type = Column(String)
+    type = Column(String)  # "post" o "poll"
+    post_id = Column(Integer, nullable=True)  # ID del mensaje en el canal
+    poll_id = Column(String, nullable=True)  # ID de la encuesta
     active = Column(Integer, default=1)
 
 class Reward(Base):
@@ -66,18 +69,10 @@ async def init_db():
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
     async with async_session() as session:
-        missions = [
-            Mission(title="Trivia Diaria", description="Responde la trivia del día", points=10, type="daily"),
-            Mission(title="Post Destacado", description="Clic en el post", points=5, type="daily")
-        ]
         rewards = [
             Reward(name="Sticker Exclusivo", description="Un sticker único", cost=20, stock=10),
             Reward(name="Rol VIP", description="Acceso a canal VIP", cost=50, stock=5)
         ]
-        for mission in missions:
-            existing = await session.execute(select(Mission).filter_by(title=mission.title))
-            if not existing.scalars().first():
-                session.add(mission)
         for reward in rewards:
             existing = await session.execute(select(Reward).filter_by(name=reward.name))
             if not existing.scalars().first():
@@ -203,7 +198,7 @@ async def show_missions(message: Message | CallbackQuery):
             missions = await session.execute(select(Mission).filter_by(active=1))
             missions = missions.scalars().all()
             if not missions:
-                response = "No hay misiones disponibles."
+                response = "No hay misiones disponibles. ¡Participa en las publicaciones y encuestas del canal!"
                 if isinstance(message, Message):
                     await message.answer(response)
                 else:
@@ -227,35 +222,6 @@ async def show_missions(message: Message | CallbackQuery):
             else:
                 await message.message.answer(response)
                 await message.answer()
-
-@router.callback_query(F.data.startswith("mission_"))
-async def handle_mission(callback: CallbackQuery):
-    logger.info(f"Procesando misión para usuario {callback.from_user.id}")
-    mission_id = int(callback.data.split("_")[1])
-    async with async_session() as session:
-        try:
-            mission = await session.get(Mission, mission_id)
-            user = await session.execute(select(User).filter_by(telegram_id=callback.from_user.id))
-            user = user.scalars().first()
-            if mission and user:
-                if mission_id not in user.completed_missions:
-                    user.points += mission.points
-                    user.completed_missions.append(mission_id)
-                    await award_achievement(user, "Primera Misión Completada", session)
-                    await session.commit()
-                    level_up = await check_level_up(user, session)
-                    msg = f"¡Misión completada! Ganaste {mission.points} puntos."
-                    if level_up:
-                        msg += f"\n¡Subiste al nivel {user.level}!"
-                    await callback.message.answer(msg)
-                else:
-                    await callback.message.answer("Ya completaste esta misión.")
-            else:
-                await callback.message.answer("Misión o usuario no encontrado.")
-            await callback.answer()
-        except Exception as e:
-            logger.error(f"Error en handle_mission: {e}")
-            await callback.message.answer("Ocurrió un error al completar la misión.")
 
 @router.message(F.text == "Tienda")
 @router.callback_query(F.data == "menu_tienda")
@@ -327,7 +293,12 @@ async def show_ranking(message: Message | CallbackQuery):
             users = users.scalars().all()
             ranking_text = "🏆 Top 10 Jugadores:\n"
             for i, user in enumerate(users, 1):
-                ranking_text += f"{i}. @{user.username or user.telegram_id} - {user.points} pts (Nivel {user.level})\n"
+                display_name = user.username or str(user.telegram_id)
+                if user.telegram_id == user_id:  # Mostrar nombre completo para el usuario que ejecuta
+                    name = f"@{display_name}"
+                else:  # Mostrar solo la primera letra para otros usuarios
+                    name = f"@{display_name[0]}..."
+                ranking_text += f"{i}. {name} - {user.points} pts (Nivel {user.level})\n"
             keyboard = InlineKeyboardMarkup(inline_keyboard=[
                 [InlineKeyboardButton(text="Volver al Menú", callback_data="back_to_menu")]
             ])
@@ -394,14 +365,87 @@ async def back_to_menu(callback: CallbackQuery):
         await callback.message.answer("Ocurrió un error al volver al menú.")
         await callback.answer()
 
-# Inicialización y ejecución
-async def main():
-    try:
-        await init_db()
-        dp.include_router(router)
-        await dp.start_polling(bot)
-    except Exception as e:
-        logger.error(f"Error en main: {e}")
+# Publicar en el canal con botones inline
+@router.message(Command("publicar"))
+async def cmd_publish(message: Message):
+    logger.info(f"Procesando /publicar para usuario {message.from_user.id}")
+    if message.from_user.id != ADMIN_ID:
+        await message.answer("No tienes permisos.")
+        return
+    if len(message.text.split()) < 2:
+        await message.answer("Uso: /publicar <texto>")
+        return
+    post_text = " ".join(message.text.split()[1:])
+    async with async_session() as session:
+        try:
+            mission = Mission(
+                title=f"Reacción a publicación {post_text[:20]}...",
+                description=post_text,
+                points=5,
+                type="post",
+                active=1
+            )
+            session.add(mission)
+            await session.commit()
+            keyboard = InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="👍 +5 pts", callback_data=f"post_{mission.id}_up")],
+                [InlineKeyboardButton(text="👎 +5 pts", callback_data=f"post_{mission.id}_down")]
+            ])
+            sent_message = await bot.send_message(CHANNEL_ID, post_text, reply_markup=keyboard)
+            mission.post_id = sent_message.message_id
+            await session.commit()
+            await message.answer("Publicación enviada al canal.")
+        except Exception as e:
+            logger.error(f"Error en /publicar: {e}")
+            await message.answer("Ocurrió un error al publicar.")
 
-if __name__ == "__main__":
-    asyncio.run(main())
+# Manejar clics en botones inline de publicaciones
+@router.callback_query(F.data.startswith("post_"))
+async def handle_post_reaction(callback: CallbackQuery):
+    logger.info(f"Procesando reacción a publicación para usuario {callback.from_user.id}")
+    data = callback.data.split("_")
+    mission_id = int(data[1])
+    async with async_session() as session:
+        try:
+            mission = await session.get(Mission, mission_id)
+            user = await session.execute(select(User).filter_by(telegram_id=callback.from_user.id))
+            user = user.scalars().first()
+            if mission and user:
+                if mission_id not in user.completed_missions:
+                    user.points += mission.points
+                    user.completed_missions.append(mission_id)
+                    await award_achievement(user, "Primera Reacción", session)
+                    await session.commit()
+                    level_up = await check_level_up(user, session)
+                    msg = f"¡Reacción registrada! Ganaste {mission.points} puntos."
+                    if level_up:
+                        msg += f"\n¡Subiste al nivel {user.level}!"
+                    await callback.message.answer(msg)
+                else:
+                    await callback.message.answer("Ya reaccionaste a esta publicación.")
+            else:
+                await callback.message.answer("Publicación o usuario no encontrado.")
+            await callback.answer()
+        except Exception as e:
+            logger.error(f"Error en handle_post_reaction: {e}")
+            await callback.message.answer("Ocurrió un error al registrar la reacción.")
+
+# Crear encuesta en el canal
+@router.message(Command("encuesta"))
+async def cmd_poll(message: Message):
+    logger.info(f"Procesando /encuesta para usuario {message.from_user.id}")
+    if message.from_user.id != ADMIN_ID:
+        await message.answer("No tienes permisos.")
+        return
+    if len(message.text.split()) < 4:
+        await message.answer("Uso: /encuesta <pregunta> <opción1> <opción2> [opción3...]")
+        return
+    args = message.text.split()[1:]
+    question = args[0]
+    options = args[1:]
+    if len(options) < 2:
+        await message.answer("Debe incluir al menos dos opciones.")
+        return
+    async with async_session() as session:
+        try:
+    
