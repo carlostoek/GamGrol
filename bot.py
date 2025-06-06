@@ -197,22 +197,21 @@ async def show_missions(message: Message | CallbackQuery):
         try:
             missions = await session.execute(select(Mission).filter_by(active=1))
             missions = missions.scalars().all()
+            response = "Misiones disponibles:\n"
             if not missions:
-                response = "No hay misiones disponibles. ¡Participa en las publicaciones y encuestas del canal!"
-                if isinstance(message, Message):
-                    await message.answer(response)
-                else:
-                    await message.message.edit_text(response)
-                    await message.answer()
-                return
+                response += "No hay misiones activas en el canal. ¡Prueba esta misión temporal!\n"
+            else:
+                for mission in missions:
+                    response += f"- {mission.title}: {mission.points} puntos\n"
+            # Botón temporal "Pruébame para sumar puntos"
             keyboard = InlineKeyboardMarkup(inline_keyboard=[
-                [InlineKeyboardButton(text=mission.title, callback_data=f"mission_{mission.id}")]
-                for mission in missions
+                [InlineKeyboardButton(text="Pruébame para sumar puntos", callback_data="test_points")],
+                [InlineKeyboardButton(text="Volver al Menú", callback_data="back_to_menu")]
             ])
             if isinstance(message, Message):
-                await message.answer("Misiones disponibles:", reply_markup=keyboard)
+                await message.answer(response, reply_markup=keyboard)
             else:
-                await message.message.edit_text("Misiones disponibles:", reply_markup=keyboard)
+                await message.message.edit_text(response, reply_markup=keyboard)
                 await message.answer()
         except Exception as e:
             logger.error(f"Error en Misiones: {e}")
@@ -222,6 +221,35 @@ async def show_missions(message: Message | CallbackQuery):
             else:
                 await message.message.answer(response)
                 await message.answer()
+
+# Manejador para el botón temporal "Pruébame para sumar puntos"
+@router.callback_query(F.data == "test_points")
+async def handle_test_points(callback: CallbackQuery):
+    logger.info(f"Procesando botón de prueba para usuario {callback.from_user.id}")
+    async with async_session() as session:
+        try:
+            user = await session.execute(select(User).filter_by(telegram_id=callback.from_user.id))
+            user = user.scalars().first()
+            if user:
+                # Usamos un identificador único para la misión de prueba
+                test_mission_id = "test_mission"
+                if test_mission_id not in user.completed_missions:
+                    user.points += 5  # Otorga 5 puntos
+                    user.completed_missions.append(test_mission_id)
+                    await session.commit()
+                    level_up = await check_level_up(user, session)
+                    msg = "¡Prueba exitosa! Ganaste 5 puntos."
+                    if level_up:
+                        msg += f"\n¡Subiste al nivel {user.level}!"
+                    await callback.message.answer(msg)
+                else:
+                    await callback.message.answer("Ya probaste esta misión.")
+            else:
+                await callback.message.answer("Usuario no encontrado. Usa /start primero.")
+            await callback.answer()
+        except Exception as e:
+            logger.error(f"Error en handle_test_points: {e}")
+            await callback.message.answer("Ocurrió un error al procesar la misión de prueba.")
 
 @router.message(F.text == "Tienda")
 @router.callback_query(F.data == "menu_tienda")
@@ -405,47 +433,6 @@ async def handle_post_reaction(callback: CallbackQuery):
     logger.info(f"Procesando reacción a publicación para usuario {callback.from_user.id}")
     data = callback.data.split("_")
     mission_id = int(data[1])
-    async with async_session() as session:
-        try:
-            mission = await session.get(Mission, mission_id)
-            user = await session.execute(select(User).filter_by(telegram_id=callback.from_user.id))
-            user = user.scalars().first()
-            if mission and user:
-                if mission_id not in user.completed_missions:
-                    user.points += mission.points
-                    user.completed_missions.append(mission_id)
-                    await award_achievement(user, "Primera Reacción", session)
-                    await session.commit()
-                    level_up = await check_level_up(user, session)
-                    msg = f"¡Reacción registrada! Ganaste {mission.points} puntos."
-                    if level_up:
-                        msg += f"\n¡Subiste al nivel {user.level}!"
-                    await callback.message.answer(msg)
-                else:
-                    await callback.message.answer("Ya reaccionaste a esta publicación.")
-            else:
-                await callback.message.answer("Publicación o usuario no encontrado.")
-            await callback.answer()
-        except Exception as e:
-            logger.error(f"Error en handle_post_reaction: {e}")
-            await callback.message.answer("Ocurrió un error al registrar la reacción.")
-
-# Crear encuesta en el canal
-@router.message(Command("encuesta"))
-async def cmd_poll(message: Message):
-    logger.info(f"Procesando /encuesta para usuario {message.from_user.id}")
-    if message.from_user.id != ADMIN_ID:
-        await message.answer("No tienes permisos.")
-        return
-    if len(message.text.split()) < 4:
-        await message.answer("Uso: /encuesta <pregunta> <opción1> <opción2> [opción3...]")
-        return
-    args = message.text.split()[1:]
-    question = args[0]
-    options = args[1:]
-    if len(options) < 2:
-        await message.answer("Debe incluir al menos dos opciones.")
-        return
     async with async_session() as session:
         try:
             mission = await session.get(Mission, mission_id)
