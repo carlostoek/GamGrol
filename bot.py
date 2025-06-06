@@ -29,7 +29,6 @@ Base = declarative_base()
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
 router = Router()
-
 class User(Base):
     __tablename__ = "users"
     id = Column(Integer, primary_key=True)
@@ -84,7 +83,6 @@ async def init_db():
 async def get_db():
     async with async_session() as session:
         yield session
-
 async def clean_old_messages(chat_id: int):
     try:
         for message_id in range(1, 1000):
@@ -130,7 +128,6 @@ inline_main_menu = InlineKeyboardMarkup(inline_keyboard=[
     [InlineKeyboardButton(text="Tienda", callback_data="menu_tienda")],
     [InlineKeyboardButton(text="Ranking", callback_data="menu_ranking")]
 ])
-
 @router.message(Command("start"))
 async def cmd_start(message: Message):
     logger.info(f"Procesando /start para usuario {message.from_user.id}")
@@ -395,8 +392,7 @@ async def show_ranking(message: Message | CallbackQuery):
             else:
                 await message.message.answer(response)
                 await message.answer()
-
-@router.message(Command("exportar"))
+        @router.message(Command("exportar"))
 async def export_data(message: Message):
     logger.info(f"Procesando /exportar para usuario {message.from_user.id}")
     if message.from_user.id != ADMIN_ID:
@@ -410,4 +406,181 @@ async def export_data(message: Message):
             writer = csv.writer(output)
             writer.writerow(["telegram_id", "username", "points", "level", "achievements"])
             for user in users:
-                writer.writerow([user.telegram_id, us
+                writer.writerow([user.telegram_id, user.username, user.points, user.level, user.achievements])
+            await message.answer_document(
+                document=io.BytesIO(output.getvalue().encode()),
+                filename="users_export.csv"
+            )
+        except Exception as e:
+            logger.error(f"Error en exportar: {e}")
+            await message.answer("Ocurrió un error al exportar datos.")
+
+@router.message(Command("resetear"))
+async def reset_season(message: Message):
+    logger.info(f"Procesando /resetear para usuario {message.from_user.id}")
+    if message.from_user.id != ADMIN_ID:
+        await message.answer("No tienes permisos.")
+        return
+    async with async_session() as session:
+        try:
+            await session.execute("UPDATE users SET points = 0, level = 1, achievements = '[]', completed_missions = '[]'")
+            await session.commit()
+            await message.answer("Temporada reseteada.")
+        except Exception as e:
+            logger.error(f"Error en resetear: {e}")
+            await message.answer("Ocurrió un error al resetear la temporada.")
+
+@router.callback_query(F.data == "back_to_menu")
+async def back_to_menu(callback: CallbackQuery):
+    logger.info(f"Procesando back_to_menu para usuario {callback.from_user.id}")
+    await clean_old_messages(callback.message.chat.id)
+    try:
+        await callback.message.edit_text("Elige una opción:", reply_markup=inline_main_menu)
+        await callback.answer()
+    except Exception as e:
+        logger.error(f"Error en back_to_menu: {e}")
+        await callback.message.answer("Ocurrió un error al volver al menú.")
+        await callback.answer()
+
+@router.message(Command("publicar"))
+async def cmd_publish(message: Message):
+    logger.info(f"Procesando /publicar para usuario {message.from_user.id}")
+    if message.from_user.id != ADMIN_ID:
+        await message.answer("No tienes permisos.")
+        return
+    if len(message.text.split()) < 2:
+        await message.answer("Uso: /publicar <texto>")
+        return
+    post_text = " ".join(message.text.split()[1:])
+    async with async_session() as session:
+        try:
+            mission = Mission(
+                title=f"Reacción a publicación {post_text[:20]}...",
+                description=post_text,
+                points=5,
+                type="post",
+                active=1
+            )
+            session.add(mission)
+            await session.commit()
+            keyboard = InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="👍 +5 pts", callback_data=f"post_{mission.id}_up")],
+                [InlineKeyboardButton(text="👎 +5 pts", callback_data=f"post_{mission.id}_down")]
+            ])
+            sent_message = await bot.send_message(CHANNEL_ID, post_text, reply_markup=keyboard)
+            mission.post_id = sent_message.message_id
+            await session.commit()
+            await message.answer("Publicación enviada al canal.")
+        except Exception as e:
+            logger.error(f"Error en /publicar: {e}")
+            await message.answer("Ocurrió un error al publicar.")
+
+@router.callback_query(F.data.startswith("post_"))
+async def handle_post_reaction(callback: CallbackQuery):
+    logger.info(f"Procesando reacción a publicación para usuario {callback.from_user.id}")
+    await clean_old_messages(callback.message.chat.id)
+    data = callback.data.split("_")
+    mission_id = int(data[1])
+    async with async_session() as session:
+        try:
+            mission = await session.get(Mission, mission_id)
+            user = await session.execute(select(User).filter_by(telegram_id=callback.from_user.id))
+            user = user.scalars().first()
+            if mission and user:
+                if mission_id not in user.completed_missions:
+                    user.points += mission.points
+                    user.completed_missions.append(mission_id)
+                    await award_achievement(user, "Primera Reacción", session)
+                    await session.commit()
+                    level_up = await check_level_up(user, session)
+                    msg = f"¡Reacción registrada! Ganaste {mission.points} puntos."
+                    if level_up:
+                        msg += f"\n¡Subiste al nivel {user.level}!"
+                    await callback.message.answer(msg)
+                else:
+                    await callback.message.answer("Ya reaccionaste a esta publicación.")
+            else:
+                await callback.message.answer("Publicación o usuario no encontrado.")
+            await callback.answer()
+        except Exception as e:
+            logger.error(f"Error en handle_post_reaction: {e}")
+            await callback.message.answer("Ocurrió un error al registrar la reacción.")
+
+@router.message(Command("encuesta"))
+async def cmd_poll(message: Message):
+    logger.info(f"Procesando /encuesta para usuario {message.from_user.id}")
+    if message.from_user.id != ADMIN_ID:
+        await message.answer("No tienes permisos.")
+        return
+    if len(message.text.split()) < 4:
+        await message.answer("Uso: /encuesta <pregunta> <opción1> <opción2> [opción3...]")
+        return
+    args = message.text.split()[1:]
+    question = args[0]
+    options = args[1:]
+    if len(options) < 2:
+        await message.answer("Debe incluir al menos dos opciones.")
+        return
+    async with async_session() as session:
+        try:
+            mission = Mission(
+                title=f"Encuesta: {question[:20]}...",
+                description=question,
+                points=10,
+                type="poll",
+                active=1
+            )
+            session.add(mission)
+            await session.commit()
+            poll = await bot.send_poll(
+                CHANNEL_ID,
+                question=question,
+                options=options,
+                is_anonymous=False,
+                type="quiz" if len(options) == 4 else "regular"
+            )
+            mission.poll_id = poll.poll.id
+            await session.commit()
+            await message.answer("Encuesta enviada al canal.")
+        except Exception as e:
+            logger.error(f"Error en /encuesta: {e}")
+            await message.answer("Ocurrió un error al crear la encuesta.")
+
+@router.poll_answer()
+async def handle_poll_answer(poll_answer: PollAnswer):
+    logger.info(f"Procesando respuesta a encuesta para usuario {poll_answer.user.id}")
+    async with async_session() as session:
+        try:
+            mission = await session.execute(select(Mission).filter_by(poll_id=poll_answer.poll_id))
+            mission = mission.scalars().first()
+            user = await session.execute(select(User).filter_by(telegram_id=poll_answer.user.id))
+            user = user.scalars().first()
+            if mission and user:
+                if mission.id not in user.completed_missions:
+                    user.points += mission.points
+                    user.completed_missions.append(mission.id)
+                    await award_achievement(user, "Primera Encuesta", session)
+                    await session.commit()
+                    level_up = await check_level_up(user, session)
+                    msg = f"¡Encuesta completada! Ganaste {mission.points} puntos."
+                    if level_up:
+                        msg += f"\n¡Subiste al nivel {user.level}!"
+                    await bot.send_message(poll_answer.user.id, msg)
+                else:
+                    await bot.send_message(poll_answer.user.id, "Ya participaste en esta encuesta.")
+            else:
+                await bot.send_message(poll_answer.user.id, "Encuesta o usuario no encontrado.")
+        except Exception as e:
+            logger.error(f"Error en handle_poll_answer: {e}")
+            await bot.send_message(poll_answer.user.id, "Ocurrió un error al registrar tu respuesta.")
+
+async def main():
+    try:
+        await init_db()
+        dp.include_router(router)
+        await dp.start_polling(bot)
+    except Exception as e:
+        logger.error(f"Error en main: {e}")
+
+if __name__ == "__main__":
+    asyncio.run(main())
