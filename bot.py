@@ -1,267 +1,562 @@
-import asyncio
-import logging
 import os
+import logging
 import csv
-import io
-from aiogram import Bot, Dispatcher, Router, F
-from aiogram.filters import Command
-from aiogram.types import Message, ReplyKeyboardMarkup, KeyboardButton, InlineKeyboardMarkup, InlineKeyboardButton
-from aiogram.fsm.storage.memory import MemoryStorage
-from dotenv import load_dotenv
-from sqlalchemy import Column, Integer, String, JSON, select
-from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession
-from sqlalchemy.orm import declarative_base, sessionmaker
+from datetime import datetime, timedelta
+from contextlib import suppress
+from aiogram import Bot, Dispatcher, types, F
+from aiogram.filters import Command, CommandObject
+from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
+from aiogram.utils.keyboard import InlineKeyboardBuilder
+from aiogram.exceptions import TelegramBadRequest
+import sqlite3
+import asyncio
 
-# Configuración de logging
+# Configuración inicial
 logging.basicConfig(level=logging.INFO)
+bot = Bot(token=os.getenv("TELEGRAM_TOKEN"))
+dp = Dispatcher()
 
-# Cargar variables de entorno
-load_dotenv()
-BOT_TOKEN = os.getenv("BOT_TOKEN")
-ADMIN_ID = int(os.getenv("ADMIN_ID", 123456789))
-DATABASE_URL = os.getenv("DATABASE_URL", "sqlite+aiosqlite:///bot.db")
+# Base de datos
+DB_NAME = "gamification.db"
 
-# Inicializar bot y dispatcher
-bot = Bot(token=BOT_TOKEN)
-dp = Dispatcher(storage=MemoryStorage())
-router = Router()
+def init_db():
+    conn = sqlite3.connect(DB_NAME)
+    c = conn.cursor()
+    
+    # Tabla de usuarios
+    c.execute('''CREATE TABLE IF NOT EXISTS users (
+                 user_id INTEGER PRIMARY KEY,
+                 username TEXT,
+                 full_name TEXT,
+                 points INTEGER DEFAULT 0,
+                 level INTEGER DEFAULT 1,
+                 last_active DATE
+                 )''')
+    
+    # Tabla de logros
+    c.execute('''CREATE TABLE IF NOT EXISTS achievements (
+                 id INTEGER PRIMARY KEY AUTOINCREMENT,
+                 name TEXT,
+                 description TEXT,
+                 icon TEXT
+                 )''')
+    
+    # Tabla de logros de usuarios
+    c.execute('''CREATE TABLE IF NOT EXISTS user_achievements (
+                 user_id INTEGER,
+                 achievement_id INTEGER,
+                 unlocked_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                 FOREIGN KEY(user_id) REFERENCES users(user_id),
+                 FOREIGN KEY(achievement_id) REFERENCES achievements(id)
+                 )''')
+    
+    # Tabla de misiones
+    c.execute('''CREATE TABLE IF NOT EXISTS missions (
+                 id INTEGER PRIMARY KEY AUTOINCREMENT,
+                 name TEXT,
+                 description TEXT,
+                 points INTEGER,
+                 type TEXT,  -- daily/weekly
+                 cooldown_hours INTEGER
+                 )''')
+    
+    # Tabla de misiones completadas
+    c.execute('''CREATE TABLE IF NOT EXISTS completed_missions (
+                 user_id INTEGER,
+                 mission_id INTEGER,
+                 completed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                 FOREIGN KEY(user_id) REFERENCES users(user_id),
+                 FOREIGN KEY(mission_id) REFERENCES missions(id)
+                 )''')
+    
+    # Tabla de tienda
+    c.execute('''CREATE TABLE IF NOT EXISTS shop (
+                 id INTEGER PRIMARY KEY AUTOINCREMENT,
+                 name TEXT,
+                 description TEXT,
+                 cost INTEGER,
+                 stock INTEGER DEFAULT -1  -- -1 = ilimitado
+                 )''')
+    
+    # Tabla de eventos
+    c.execute('''CREATE TABLE IF NOT EXISTS events (
+                 id INTEGER PRIMARY KEY AUTOINCREMENT,
+                 name TEXT,
+                 description TEXT,
+                 multiplier REAL DEFAULT 1.0,
+                 active BOOLEAN DEFAULT 0,
+                 start_time TIMESTAMP,
+                 end_time TIMESTAMP
+                 )''')
+    
+    # Insertar logros iniciales
+    initial_achievements = [
+        ("Primeros Pasos", "Completa tu primera misión", "🚀"),
+        ("Nivel 5", "Alcanza el nivel 5", "⭐"),
+        ("Comprometido", "Participa 3 días seguidos", "🔥"),
+        ("Coleccionista", "Desbloquea 5 logros", "🏆"),
+        ("Maestro de Trivias", "Responde correctamente 10 trivias", "🧠")
+    ]
+    
+    c.executemany('INSERT OR IGNORE INTO achievements (name, description, icon) VALUES (?, ?, ?)', initial_achievements)
+    
+    # Insertar misiones iniciales
+    initial_missions = [
+        ("Visita Diaria", "Haz clic en el post destacado", 5, "daily", 24),
+        ("Trivia Semanal", "Participa en la trivia de esta semana", 20, "weekly", 168),
+        ("Explorador", "Visita 3 secciones diferentes", 15, "daily", 24),
+        ("Comprador", "Adquiere un artículo en la tienda", 10, "weekly", 168),
+        ("Social", "Comparte el canal con un amigo", 25, "daily", 24)
+    ]
+    
+    c.executemany('INSERT OR IGNORE INTO missions (name, description, points, type, cooldown_hours) VALUES (?, ?, ?, ?, ?)', initial_missions)
+    
+    conn.commit()
+    conn.close()
 
-# Base de datos (SQLAlchemy)
-Base = declarative_base()
+init_db()
 
-class User(Base):
-    __tablename__ = "users"
-    id = Column(Integer, primary_key=True)
-    telegram_id = Column(Integer, unique=True)
-    username = Column(String, nullable=True)
-    points = Column(Integer, default=0)
-    level = Column(Integer, default=1)
-    achievements = Column(JSON, default=[])
-    completed_missions = Column(JSON, default=[])
-
-class Mission(Base):
-    __tablename__ = "missions"
-    id = Column(Integer, primary_key=True)
-    title = Column(String)
-    description = Column(String)
-    points = Column(Integer)
-    type = Column(String)
-    active = Column(Integer, default=1)
-
-class Reward(Base):
-    __tablename__ = "rewards"
-    id = Column(Integer, primary_key=True)
-    name = Column(String)
-    description = Column(String)
-    cost = Column(Integer)
-    stock = Column(Integer, default=1)
-
-# Configuración de la base de datos
-engine = create_async_engine(DATABASE_URL, echo=True)
-async_session = sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
-
-async def init_db():
-    async with engine.begin() as conn:
-        await conn.run_sync(Base.metadata.create_all)
-    # Crear misiones y recompensas iniciales
-    async with async_session() as session:
-        missions = [
-            Mission(title="Trivia Diaria", description="Responde la trivia del día", points=10, type="daily"),
-            Mission(title="Post Destacado", description="Clic en el post", points=5, type="daily")
-        ]
-        rewards = [
-            Reward(name="Sticker Exclusivo", description="Un sticker único", cost=20, stock=10),
-            Reward(name="Rol VIP", description="Acceso a canal VIP", cost=50, stock=5)
-        ]
-        for mission in missions:
-            existing = await session.execute(select(Mission).filter_by(title=mission.title))
-            if not existing.scalars().first():
-                session.add(mission)
-        for reward in rewards:
-            existing = await session.execute(select(Reward).filter_by(name=reward.name))
-            if not existing.scalars().first():
-                session.add(reward)
-        await session.commit()
-
-async def get_db():
-    async with async_session() as session:
-        yield session
-
-# Lógica de gamificación
-async def award_points(user: User, points: int, session: AsyncSession):
-    user.points += points
-    await session.commit()
-
-async def check_level_up(user: User, session: AsyncSession):
-    level_thresholds = {2: 10, 3: 25, 4: 50, 5: 100}
-    for level, points_needed in level_thresholds.items():
-        if user.points >= points_needed and user.level < level:
-            user.level = level
-            await award_achievement(user, f"Nivel {level} Alcanzado", session)
-            await session.commit()
-            return True
-    return False
-
-async def award_achievement(user: User, achievement: str, session: AsyncSession):
-    if achievement not in user.achievements:
-        user.achievements.append(achievement)
-        await session.commit()
-        return True
-    return False
-
-# Menú fijo
-main_menu = ReplyKeyboardMarkup(
-    keyboard=[
-        [KeyboardButton(text="Perfil"), KeyboardButton(text="Misiones")],
-        [KeyboardButton(text="Tienda"), KeyboardButton(text="Ranking")]
-    ],
-    resize_keyboard=True
-)
-
-# Handlers
-@router.message(Command("start"))
-async def cmd_start(message: Message):
-    async for session in get_db():
-        user = await session.get(User, message.from_user.id)
-        if not user:
-            user = User(telegram_id=message.from_user.id, username=message.from_user.username)
-            session.add(user)
-            await session.commit()
-        await message.answer(
-            "¡Bienvenido al bot gamificado! 🎮\nUsa el menú para navegar.",
-            reply_markup=main_menu
-        )
-
-@router.message(F.text == "Perfil")
-async def cmd_profile(message: Message):
-    async for session in get_db():
-        user = await session.get(User, message.from_user.id)
+# Clase para manejar la base de datos
+class Database:
+    @staticmethod
+    def get_connection():
+        return sqlite3.connect(DB_NAME)
+    
+    @staticmethod
+    def get_user(user_id: int):
+        conn = Database.get_connection()
+        c = conn.cursor()
+        c.execute("SELECT * FROM users WHERE user_id = ?", (user_id,))
+        user = c.fetchone()
+        conn.close()
+        return user
+    
+    @staticmethod
+    def create_user(user: types.User):
+        conn = Database.get_connection()
+        c = conn.cursor()
+        c.execute("INSERT OR IGNORE INTO users (user_id, username, full_name) VALUES (?, ?, ?)",
+                  (user.id, user.username, user.full_name))
+        conn.commit()
+        conn.close()
+    
+    @staticmethod
+    def update_user_points(user_id: int, points: int):
+        conn = Database.get_connection()
+        c = conn.cursor()
+        c.execute("UPDATE users SET points = points + ? WHERE user_id = ?", (points, user_id))
+        
+        # Verificar si subió de nivel
+        user = Database.get_user(user_id)
         if user:
-            profile_text = (
-                f"👤 Perfil de @{user.username or user.telegram_id}\n"
-                f"📊 Puntos: {user.points}\n"
-                f"🏆 Nivel: {user.level}\n"
-                f"🎖 Logros: {', '.join(user.achievements) or 'Ninguno'}"
-            )
-            keyboard = InlineKeyboardMarkup(inline_keyboard=[
-                [InlineKeyboardButton(text="Volver al Menú", callback_data="back_to_menu")]
-            ])
-            await message.answer(profile_text, reply_markup=keyboard)
-        else:
-            await message.answer("Por favor, usa /start primero.")
-
-@router.message(F.text == "Misiones")
-async def show_missions(message: Message):
-    async for session in get_db():
-        missions = await session.execute(select(Mission).filter_by(active=1))
-        missions = missions.scalars().all()
-        keyboard = InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text=mission.title, callback_data=f"mission_{mission.id}")]
-            for mission in missions
-        ])
-        await message.answer("Misiones disponibles:", reply_markup=keyboard)
-
-@router.callback_query(F.data.startswith("mission_"))
-async def handle_mission(callback: CallbackQuery):
-    mission_id = int(callback.data.split("_")[1])
-    async for session in get_db():
-        mission = await session.get(Mission, mission_id)
-        user = await session.get(User, callback.from_user.id)
-        if mission and user:
-            if mission_id not in user.completed_missions:
-                user.points += mission.points
-                user.completed_missions.append(mission_id)
-                await award_achievement(user, "Primera Misión Completada", session)
-                await session.commit()
-                level_up = await check_level_up(user, session)
-                msg = f"¡Misión completada! Ganaste {mission.points} puntos."
-                if level_up:
-                    msg += f"\n¡Subiste al nivel {user.level}!"
-                await callback.message.answer(msg)
+            new_level = Database.calculate_level(user[3] + points)
+            if new_level > user[4]:
+                c.execute("UPDATE users SET level = ? WHERE user_id = ?", (new_level, user_id))
+                conn.commit()
+                conn.close()
+                return new_level
+        
+        conn.commit()
+        conn.close()
+        return False
+    
+    @staticmethod
+    def calculate_level(points: int):
+        # Fórmula de niveles: nivel^2 * 10
+        level = 1
+        while points >= (level ** 2) * 10:
+            level += 1
+        return level
+    
+    @staticmethod
+    def get_achievements(user_id: int):
+        conn = Database.get_connection()
+        c = conn.cursor()
+        c.execute('''SELECT a.id, a.name, a.description, a.icon 
+                     FROM user_achievements ua
+                     JOIN achievements a ON ua.achievement_id = a.id
+                     WHERE ua.user_id = ?''', (user_id,))
+        achievements = c.fetchall()
+        conn.close()
+        return achievements
+    
+    @staticmethod
+    def unlock_achievement(user_id: int, achievement_name: str):
+        conn = Database.get_connection()
+        c = conn.cursor()
+        c.execute("SELECT id FROM achievements WHERE name = ?", (achievement_name,))
+        achievement = c.fetchone()
+        
+        if achievement:
+            achievement_id = achievement[0]
+            # Verificar si ya lo tiene
+            c.execute("SELECT * FROM user_achievements WHERE user_id = ? AND achievement_id = ?", 
+                      (user_id, achievement_id))
+            if not c.fetchone():
+                c.execute("INSERT INTO user_achievements (user_id, achievement_id) VALUES (?, ?)",
+                          (user_id, achievement_id))
+                conn.commit()
+                conn.close()
+                return True
+        conn.close()
+        return False
+    
+    @staticmethod
+    def complete_mission(user_id: int, mission_id: int):
+        conn = Database.get_connection()
+        c = conn.cursor()
+        
+        # Verificar si ya completó la misión recientemente
+        c.execute('''SELECT completed_at FROM completed_missions 
+                     WHERE user_id = ? AND mission_id = ? 
+                     ORDER BY completed_at DESC LIMIT 1''', (user_id, mission_id))
+        last_completion = c.fetchone()
+        
+        if last_completion:
+            last_time = datetime.strptime(last_completion[0], "%Y-%m-%d %H:%M:%S")
+            mission = Database.get_mission(mission_id)
+            if mission and (datetime.now() - last_time) < timedelta(hours=mission[4]):
+                conn.close()
+                return False
+        
+        # Registrar misión completada
+        c.execute("INSERT INTO completed_missions (user_id, mission_id) VALUES (?, ?)",
+                  (user_id, mission_id))
+        
+        # Obtener puntos de la misión
+        mission = Database.get_mission(mission_id)
+        if mission:
+            points = mission[3]
+            # Aplicar multiplicador de eventos activos
+            multiplier = Database.get_active_multiplier()
+            points = int(points * multiplier)
+            
+            # Actualizar puntos del usuario
+            Database.update_user_points(user_id, points)
+            
+            # Verificar logros
+            if mission_id == 1:  # Primera misión
+                Database.unlock_achievement(user_id, "Primeros Pasos")
+            
+            conn.commit()
+            conn.close()
+            return points
+        conn.close()
+        return 0
+    
+    @staticmethod
+    def get_mission(mission_id: int):
+        conn = Database.get_connection()
+        c = conn.cursor()
+        c.execute("SELECT * FROM missions WHERE id = ?", (mission_id,))
+        mission = c.fetchone()
+        conn.close()
+        return mission
+    
+    @staticmethod
+    def get_active_missions(user_id: int):
+        conn = Database.get_connection()
+        c = conn.cursor()
+        
+        # Obtener todas las misiones
+        c.execute("SELECT * FROM missions")
+        all_missions = c.fetchall()
+        
+        # Filtrar misiones disponibles
+        available_missions = []
+        for mission in all_missions:
+            mission_id = mission[0]
+            c.execute('''SELECT completed_at FROM completed_missions 
+                         WHERE user_id = ? AND mission_id = ?
+                         ORDER BY completed_at DESC LIMIT 1''', (user_id, mission_id))
+            last_completion = c.fetchone()
+            
+            if not last_completion:
+                available_missions.append(mission)
             else:
-                await callback.message.answer("Ya completaste esta misión.")
-        await callback.answer()
+                last_time = datetime.strptime(last_completion[0], "%Y-%m-%d %H:%M:%S")
+                cooldown = timedelta(hours=mission[5])
+                if (datetime.now() - last_time) > cooldown:
+                    available_missions.append(mission)
+        
+        conn.close()
+        return available_missions
+    
+    @staticmethod
+    def get_shop_items():
+        conn = Database.get_connection()
+        c = conn.cursor()
+        c.execute("SELECT * FROM shop")
+        items = c.fetchall()
+        conn.close()
+        return items
+    
+    @staticmethod
+    def create_shop_item(name: str, description: str, cost: int, stock: int = -1):
+        conn = Database.get_connection()
+        c = conn.cursor()
+        c.execute("INSERT INTO shop (name, description, cost, stock) VALUES (?, ?, ?, ?)",
+                  (name, description, cost, stock))
+        conn.commit()
+        conn.close()
+    
+    @staticmethod
+    def create_event(name: str, description: str, multiplier: float, hours: int):
+        conn = Database.get_connection()
+        c = conn.cursor()
+        now = datetime.now()
+        end_time = now + timedelta(hours=hours)
+        
+        # Desactivar eventos anteriores
+        c.execute("UPDATE events SET active = 0")
+        
+        # Crear nuevo evento
+        c.execute('''INSERT INTO events (name, description, multiplier, active, start_time, end_time)
+                     VALUES (?, ?, ?, 1, ?, ?)''',
+                  (name, description, multiplier, now.strftime("%Y-%m-%d %H:%M:%S"), 
+                   end_time.strftime("%Y-%m-%d %H:%M:%S")))
+        conn.commit()
+        conn.close()
+    
+    @staticmethod
+    def get_active_multiplier():
+        conn = Database.get_connection()
+        c = conn.cursor()
+        c.execute("SELECT multiplier FROM events WHERE active = 1 AND end_time > CURRENT_TIMESTAMP")
+        event = c.fetchone()
+        conn.close()
+        return event[0] if event else 1.0
+    
+    @staticmethod
+    def get_ranking():
+        conn = Database.get_connection()
+        c = conn.cursor()
+        c.execute("SELECT user_id, username, points, level FROM users ORDER BY points DESC LIMIT 10")
+        ranking = c.fetchall()
+        conn.close()
+        return ranking
+    
+    @staticmethod
+    def reset_season():
+        conn = Database.get_connection()
+        c = conn.cursor()
+        
+        # Guardar historial
+        c.execute('''CREATE TABLE IF NOT EXISTS season_history AS
+                     SELECT user_id, username, points, level, datetime('now') AS reset_date
+                     FROM users''')
+        
+        # Resetear puntos y niveles
+        c.execute("UPDATE users SET points = 0, level = 1")
+        
+        # Limpiar misiones completadas
+        c.execute("DELETE FROM completed_missions")
+        
+        conn.commit()
+        conn.close()
+    
+    @staticmethod
+    def export_data():
+        filename = "user_data.csv"
+        conn = Database.get_connection()
+        
+        # Exportar usuarios
+        with open(filename, 'w', newline='', encoding='utf-8') as f:
+            writer = csv.writer(f)
+            c = conn.cursor()
+            c.execute("SELECT * FROM users")
+            writer.writerow([i[0] for i in c.description])
+            writer.writerows(c.fetchall())
+        
+        conn.close()
+        return filename
 
-@router.message(F.text == "Tienda")
-async def show_store(message: Message):
-    async for session in get_db():
-        rewards = await session.execute(select(Reward).filter(Reward.stock > 0))
-        rewards = rewards.scalars().all()
-        keyboard = InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text=f"{r.name} ({r.cost} pts)", callback_data=f"reward_{r.id}")]
-            for r in rewards
-        ])
-        await message.answer("Tienda de recompensas:", reply_markup=keyboard)
+# ======================
+# HANDLERS PRINCIPALES
+# ======================
 
-@router.callback_query(F.data.startswith("reward_"))
-async def handle_reward(callback: CallbackQuery):
-    reward_id = int(callback.data.split("_")[1])
-    async for session in get_db():
-        reward = await session.get(Reward, reward_id)
-        user = await session.get(User, callback.from_user.id)
-        if reward and user and reward.stock > 0:
-            if user.points >= reward.cost:
-                user.points -= reward.cost
-                reward.stock -= 1
-                await session.commit()
-                await callback.message.answer(f"¡Canjeaste {reward.name}!")
-            else:
-                await callback.message.answer("No tienes suficientes puntos.")
-        else:
-            await callback.message.answer("Recompensa no disponible.")
-        await callback.answer()
+@dp.message(Command("start"))
+async def cmd_start(message: types.Message):
+    Database.create_user(message.from_user)
+    await show_main_menu(message)
 
-@router.message(F.text == "Ranking")
-async def show_ranking(message: Message):
-    async for session in get_db():
-        users = await session.execute(select(User).order_by(User.points.desc()).limit(10))
-        users = users.scalars().all()
-        ranking_text = "🏆 Top 10 Jugadores:\n"
-        for i, user in enumerate(users, 1):
-            ranking_text += f"{i}. @{user.username or user.telegram_id} - {user.points} pts (Nivel {user.level})\n"
-        keyboard = InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="Volver al Menú", callback_data="back_to_menu")]
-        ])
-        await message.answer(ranking_text, reply_markup=keyboard)
+@dp.message(Command("menu"))
+async def cmd_menu(message: types.Message):
+    await show_main_menu(message)
 
-@router.message(Command("exportar"))
-async def export_data(message: Message):
-    if message.from_user.id != ADMIN_ID:
-        await message.answer("No tienes permisos.")
+async def show_main_menu(message: types.Message):
+    builder = InlineKeyboardBuilder()
+    builder.row(
+        InlineKeyboardButton(text="👤 Perfil", callback_data="profile"),
+        InlineKeyboardButton(text="📋 Misiones", callback_data="missions")
+    )
+    builder.row(
+        InlineKeyboardButton(text="🏪 Tienda", callback_data="shop"),
+        InlineKeyboardButton(text="🏆 Ranking", callback_data="ranking")
+    )
+    
+    await message.answer(
+        "🎮 Bienvenido al Sistema de Gamificación\n"
+        "Elige una opción del menú:",
+        reply_markup=builder.as_markup()
+    )
+
+# ======================
+# PERFIL DE USUARIO
+# ======================
+
+@dp.callback_query(F.data == "profile"))
+async def show_profile(callback: types.CallbackQuery):
+    user_id = callback.from_user.id
+    user = Database.get_user(user_id)
+    
+    if not user:
+        await callback.answer("Usuario no encontrado")
         return
-    async for session in get_db():
-        users = await session.execute(select(User))
-        users = users.scalars().all()
-        output = io.StringIO()
-        writer = csv.writer(output)
-        writer.writerow(["telegram_id", "username", "points", "level", "achievements"])
-        for user in users:
-            writer.writerow([user.telegram_id, user.username, user.points, user.level, user.achievements])
-        await message.answer_document(
-            document=io.BytesIO(output.getvalue().encode()),
-            filename="users_export.csv"
-        )
+    
+    points = user[3]
+    level = user[4]
+    achievements = Database.get_achievements(user_id)
+    
+    # Calcular progreso al siguiente nivel
+    current_level_points = (level ** 2) * 10
+    next_level_points = ((level + 1) ** 2) * 10
+    progress = min(100, int((points - current_level_points) / (next_level_points - current_level_points) * 100))
+    
+    # Construir texto del perfil
+    text = (
+        f"👤 *Perfil de {callback.from_user.full_name}*\n\n"
+        f"⭐ *Puntos:* `{points}`\n"
+        f"🚀 *Nivel:* `{level}`\n"
+        f"📊 *Progreso:* `{progress}%`\n\n"
+        f"🏆 *Logros:* `{len(achievements)}/20`"
+    )
+    
+    # Construir logros
+    achievements_text = "\n".join([f"{a[3]} {a[1]}" for a in achievements[:3]])
+    if achievements_text:
+        text += f"\n\n{achievements_text}"
+    
+    # Botones
+    builder = InlineKeyboardBuilder()
+    builder.row(
+        InlineKeyboardButton(text="Ver Todos los Logros", callback_data="all_achievements"),
+        InlineKeyboardButton(text="Misiones Activas", callback_data="missions")
+    )
+    builder.row(InlineKeyboardButton(text="⬅️ Menú Principal", callback_data="main_menu"))
+    
+    await callback.message.edit_text(text, reply_markup=builder.as_markup(), parse_mode="Markdown")
 
-@router.message(Command("resetear"))
-async def reset_season(message: Message):
-    if message.from_user.id != ADMIN_ID:
-        await message.answer("No tienes permisos.")
+# ======================
+# SISTEMA DE MISIONES
+# ======================
+
+@dp.callback_query(F.data == "missions"))
+async def show_missions(callback: types.CallbackQuery):
+    user_id = callback.from_user.id
+    missions = Database.get_active_missions(user_id)
+    
+    if not missions:
+        text = "🎯 No tienes misiones disponibles en este momento"
+    else:
+        text = "🎯 *Misiones Activas*\n\n"
+        for mission in missions:
+            text += f"• {mission[1]} - `+{mission[3]} puntos`\n{mission[2]}\n\n"
+    
+    builder = InlineKeyboardBuilder()
+    for mission in missions[:3]:  # Mostrar máximo 3 misiones
+        builder.row(InlineKeyboardButton(
+            text=f"✅ Completar: {mission[1]}",
+            callback_data=f"complete_mission:{mission[0]}"
+        ))
+    
+    builder.row(InlineKeyboardButton(text="⬅️ Menú Principal", callback_data="main_menu"))
+    
+    await callback.message.edit_text(text, reply_markup=builder.as_markup(), parse_mode="Markdown")
+
+@dp.callback_query(F.data.startswith("complete_mission:"))
+async def complete_mission(callback: types.CallbackQuery):
+    mission_id = int(callback.data.split(":")[1])
+    user_id = callback.from_user.id
+    points_earned = Database.complete_mission(user_id, mission_id)
+    
+    if points_earned:
+        # Verificar si desbloqueó algún logro
+        user = Database.get_user(user_id)
+        if user and user[4] >= 5:
+            Database.unlock_achievement(user_id, "Nivel 5")
+        
+        await callback.answer(f"✅ ¡Misión completada! +{points_earned} puntos", show_alert=True)
+        await show_missions(callback)
+    else:
+        await callback.answer("⏳ Esta misión no está disponible todavía", show_alert=True)
+
+# ======================
+# TIENDA DE RECOMPENSAS
+# ======================
+
+@dp.callback_query(F.data == "shop"))
+async def show_shop(callback: types.CallbackQuery):
+    items = Database.get_shop_items()
+    
+    if not items:
+        text = "🏪 La tienda está vacía por ahora"
+    else:
+        text = "🏪 *Tienda de Recompensas*\n\n"
+        for item in items:
+            text += f"• *{item[1]}* - `{item[3]} puntos`\n{item[2]}\n\n"
+    
+    builder = InlineKeyboardBuilder()
+    for item in items[:3]:  # Mostrar máximo 3 ítems
+        builder.row(InlineKeyboardButton(
+            text=f"🛒 Canjear: {item[1]}",
+            callback_data=f"redeem:{item[0]}"
+        ))
+    
+    builder.row(InlineKeyboardButton(text="⬅️ Menú Principal", callback_data="main_menu"))
+    
+    await callback.message.edit_text(text, reply_markup=builder.as_markup(), parse_mode="Markdown")
+
+# ======================
+# RANKING DE USUARIOS
+# ======================
+
+@dp.callback_query(F.data == "ranking"))
+async def show_ranking(callback: types.CallbackQuery):
+    ranking = Database.get_ranking()
+    
+    if not ranking:
+        text = "🏆 Todavía no hay datos para mostrar el ranking"
+    else:
+        text = "🏆 *Top 10 Jugadores*\n\n"
+        for i, player in enumerate(ranking, 1):
+            username = player[1] or f"Usuario {player[0]}"
+            text += f"{i}. {username} - `{player[2]} puntos` (Nvl {player[3]})\n"
+    
+    builder = InlineKeyboardBuilder()
+    builder.row(InlineKeyboardButton(text="🔄 Actualizar", callback_data="ranking"))
+    builder.row(InlineKeyboardButton(text="⬅️ Menú Principal", callback_data="main_menu"))
+    
+    await callback.message.edit_text(text, reply_markup=builder.as_markup(), parse_mode="Markdown")
+
+# ======================
+# PANEL DE ADMINISTRACIÓN
+# ======================
+
+@dp.message(Command("admin"))
+async def admin_panel(message: types.Message):
+    if message.from_user.id != int(os.getenv("ADMIN_ID")):
+        await message.answer("⛔ Acceso denegado")
         return
-    async for session in get_db():
-        await session.execute("UPDATE users SET points = 0, level = 1, achievements = '[]', completed_missions = '[]'")
-        await session.commit()
-        await message.answer("Temporada reseteada.")
-
-@router.callback_query(F.data == "back_to_menu")
-async def back_to_menu(callback: CallbackQuery):
-    await callback.message.edit_text("Vuelve al menú:", reply_markup=main_menu)
-    await callback.answer()
-
-# Inicialización y ejecución
-async def main():
-    await init_db()
-    dp.include_router(router)
-    await dp.start_polling(bot)
-
-if __name__ == "__main__":
-    asyncio.run(main())
+    
+    builder = InlineKeyboardBuilder()
+    builder.row(
+        InlineKeyboardButton(text="✨ Activar Evento", callback_data="activate_event"),
+        InlineKeyboardButton(text="🎁 Crear Recompensa", callback_data="create_reward")
+    )
+    builder.row(
+        InlineKeyboardButton(text="🔄 Resetear Temporada", callback_data="reset_season"),
+        InlineKeyboardButton(text="📤 Exportar Datos", callback_data="export_data")
+    )
+    
+    await message.ans
