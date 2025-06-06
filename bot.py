@@ -18,8 +18,8 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
-ADMIN_ID = int(os.getenv("ADMIN_ID"))
-CHANNEL_ID = int(os.getenv("CHANNEL_ID"))
+ADMIN_ID = int(os.getenv("ADMIN_ID", 0))  # Valor por defecto para evitar NoneType
+CHANNEL_ID = int(os.getenv("CHANNEL_ID", 0))  # Valor por defecto para evitar NoneType
 DATABASE_URL = os.getenv("DATABASE_URL", "sqlite+aiosqlite:///bot.db")
 
 engine = create_async_engine(DATABASE_URL, echo=False)
