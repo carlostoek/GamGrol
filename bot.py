@@ -392,7 +392,7 @@ async def show_ranking(message: Message | CallbackQuery):
             else:
                 await message.message.answer(response)
                 await message.answer()
-        @router.message(Command("exportar"))
+@router.message(Command("exportar"))
 async def export_data(message: Message):
     logger.info(f"Procesando /exportar para usuario {message.from_user.id}")
     if message.from_user.id != ADMIN_ID:
