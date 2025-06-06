@@ -1,42 +1,40 @@
 import asyncio
-import logging
-import os
-import csv
 import io
+import csv
+import logging
+from typing import List
 from aiogram import Bot, Dispatcher, Router, F
-from aiogram.filters import Command
-from aiogram.types import Message, ReplyKeyboardMarkup, KeyboardButton, InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery, PollAnswer
-from aiogram.fsm.storage.memory import MemoryStorage
-from dotenv import load_dotenv
-from sqlalchemy import Column, Integer, String, JSON, select
-from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession
-from sqlalchemy.orm import declarative_base, sessionmaker
+from aiogram.types import Message, CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup, KeyboardButton, PollAnswer
+from aiogram.exceptions import TelegramAPIError
+from sqlalchemy import Column, Integer, String, select, JSON
+from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession, async_sessionmaker
+from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.exc import IntegrityError
+from dotenv import load_dotenv
+import os
 
-# Configuración de logging
+load_dotenv()
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# Cargar variables de entorno
-load_dotenv()
 BOT_TOKEN = os.getenv("BOT_TOKEN")
-ADMIN_ID = int(os.getenv("ADMIN_ID", 123456789))
-CHANNEL_ID = int(os.getenv("CHANNEL_ID", -1001234567890))  # ID del canal VIP
+ADMIN_ID = int(os.getenv("ADMIN_ID"))
+CHANNEL_ID = int(os.getenv("CHANNEL_ID"))
 DATABASE_URL = os.getenv("DATABASE_URL", "sqlite+aiosqlite:///bot.db")
 
-# Inicializar bot y dispatcher
-bot = Bot(token=BOT_TOKEN)
-dp = Dispatcher(storage=MemoryStorage())
-router = Router()
-
-# Base de datos (SQLAlchemy)
+engine = create_async_engine(DATABASE_URL, echo=False)
+async_session = async_sessionmaker(engine, expire_on_commit=False)
 Base = declarative_base()
+
+bot = Bot(token=BOT_TOKEN)
+dp = Dispatcher()
+router = Router()
 
 class User(Base):
     __tablename__ = "users"
     id = Column(Integer, primary_key=True)
     telegram_id = Column(Integer, unique=True)
-    username = Column(String, nullable=True)
+    username = Column(String)
     points = Column(Integer, default=0)
     level = Column(Integer, default=1)
     achievements = Column(JSON, default=[])
@@ -48,22 +46,18 @@ class Mission(Base):
     title = Column(String)
     description = Column(String)
     points = Column(Integer)
-    type = Column(String)  # "post" o "poll"
-    post_id = Column(Integer, nullable=True)  # ID del mensaje en el canal
-    poll_id = Column(String, nullable=True)  # ID de la encuesta
+    type = Column(String)  # "post" or "poll"
     active = Column(Integer, default=1)
+    post_id = Column(Integer, nullable=True)
+    poll_id = Column(String, nullable=True)
 
 class Reward(Base):
     __tablename__ = "rewards"
     id = Column(Integer, primary_key=True)
-    name = Column(String)
+    name = Column(String, unique=True)
     description = Column(String)
     cost = Column(Integer)
-    stock = Column(Integer, default=1)
-
-# Configuración de la base de datos
-engine = create_async_engine(DATABASE_URL, echo=False)
-async_session = sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
+    stock = Column(Integer)
 
 async def init_db():
     async with engine.begin() as conn:
@@ -91,7 +85,16 @@ async def get_db():
     async with async_session() as session:
         yield session
 
-# Lógica de gamificación
+async def clean_old_messages(chat_id: int):
+    try:
+        for message_id in range(1, 1000):
+            try:
+                await bot.delete_message(chat_id=chat_id, message_id=message_id)
+            except Exception:
+                continue
+    except Exception as e:
+        logger.debug(f"No se pudieron eliminar mensajes antiguos: {e}")
+
 async def award_points(user: User, points: int, session: AsyncSession):
     user.points += points
     await session.commit()
@@ -113,7 +116,6 @@ async def award_achievement(user: User, achievement: str, session: AsyncSession)
         return True
     return False
 
-# Menú fijo
 main_menu = ReplyKeyboardMarkup(
     keyboard=[
         [KeyboardButton(text="Perfil"), KeyboardButton(text="Misiones")],
@@ -122,7 +124,6 @@ main_menu = ReplyKeyboardMarkup(
     resize_keyboard=True
 )
 
-# Menú inline para "Volver al Menú"
 inline_main_menu = InlineKeyboardMarkup(inline_keyboard=[
     [InlineKeyboardButton(text="Perfil", callback_data="menu_perfil")],
     [InlineKeyboardButton(text="Misiones", callback_data="menu_misiones")],
@@ -130,10 +131,10 @@ inline_main_menu = InlineKeyboardMarkup(inline_keyboard=[
     [InlineKeyboardButton(text="Ranking", callback_data="menu_ranking")]
 ])
 
-# Handlers
 @router.message(Command("start"))
 async def cmd_start(message: Message):
     logger.info(f"Procesando /start para usuario {message.from_user.id}")
+    await clean_old_messages(message.chat.id)
     async with async_session() as session:
         try:
             user = await session.execute(select(User).filter_by(telegram_id=message.from_user.id))
@@ -160,7 +161,9 @@ async def cmd_start(message: Message):
 @router.callback_query(F.data == "menu_perfil")
 async def cmd_profile(message: Message | CallbackQuery):
     user_id = message.from_user.id if isinstance(message, Message) else message.from_user.id
+    chat_id = message.chat.id if isinstance(message, Message) else message.message.chat.id
     logger.info(f"Procesando Perfil para usuario {user_id}")
+    await clean_old_messages(chat_id)
     async with async_session() as session:
         try:
             user = await session.execute(select(User).filter_by(telegram_id=user_id))
@@ -200,7 +203,9 @@ async def cmd_profile(message: Message | CallbackQuery):
 @router.callback_query(F.data == "menu_misiones")
 async def show_missions(message: Message | CallbackQuery):
     user_id = message.from_user.id if isinstance(message, Message) else message.from_user.id
+    chat_id = message.chat.id if isinstance(message, Message) else message.message.chat.id
     logger.info(f"Procesando Misiones para usuario {user_id}")
+    await clean_old_messages(chat_id)
     async with async_session() as session:
         try:
             missions = await session.execute(select(Mission).filter_by(active=1))
@@ -211,7 +216,6 @@ async def show_missions(message: Message | CallbackQuery):
             else:
                 for mission in missions:
                     response += f"- {mission.title}: {mission.points} puntos\n"
-            # Botón temporal "Pruébame para sumar puntos"
             keyboard = InlineKeyboardMarkup(inline_keyboard=[
                 [InlineKeyboardButton(text="Pruébame para sumar puntos", callback_data="test_points")],
                 [InlineKeyboardButton(text="Volver al Menú", callback_data="back_to_menu")]
@@ -230,19 +234,18 @@ async def show_missions(message: Message | CallbackQuery):
                 await message.message.answer(response)
                 await message.answer()
 
-# Manejador para el botón temporal "Pruébame para sumar puntos"
 @router.callback_query(F.data == "test_points")
 async def handle_test_points(callback: CallbackQuery):
     logger.info(f"Procesando botón de prueba para usuario {callback.from_user.id}")
+    await clean_old_messages(callback.message.chat.id)
     async with async_session() as session:
         try:
             user = await session.execute(select(User).filter_by(telegram_id=callback.from_user.id))
             user = user.scalars().first()
             if user:
-                # Usamos un identificador único para la misión de prueba
                 test_mission_id = "test_mission"
                 if test_mission_id not in user.completed_missions:
-                    user.points += 5  # Otorga 5 puntos
+                    user.points += 5
                     user.completed_missions.append(test_mission_id)
                     await session.commit()
                     level_up = await check_level_up(user, session)
@@ -263,7 +266,9 @@ async def handle_test_points(callback: CallbackQuery):
 @router.callback_query(F.data == "menu_tienda")
 async def show_store(message: Message | CallbackQuery):
     user_id = message.from_user.id if isinstance(message, Message) else message.from_user.id
+    chat_id = message.chat.id if isinstance(message, Message) else message.message.chat.id
     logger.info(f"Procesando Tienda para usuario {user_id}")
+    await clean_old_messages(chat_id)
     async with async_session() as session:
         try:
             rewards = await session.execute(select(Reward).filter(Reward.stock > 0))
@@ -276,14 +281,15 @@ async def show_store(message: Message | CallbackQuery):
                     await message.message.edit_text(response)
                     await message.answer()
                 return
+            response = "Tienda de recompensas:\nHaz clic para ver detalles y confirmar."
             keyboard = InlineKeyboardMarkup(inline_keyboard=[
                 [InlineKeyboardButton(text=f"{r.name} ({r.cost} pts)", callback_data=f"reward_{r.id}")]
                 for r in rewards
             ])
             if isinstance(message, Message):
-                await message.answer("Tienda de recompensas:", reply_markup=keyboard)
+                await message.answer(response, reply_markup=keyboard)
             else:
-                await message.message.edit_text("Tienda de recompensas:", reply_markup=keyboard)
+                await message.message.edit_text(response, reply_markup=keyboard)
                 await message.answer()
         except Exception as e:
             logger.error(f"Error en Tienda: {e}")
@@ -297,7 +303,43 @@ async def show_store(message: Message | CallbackQuery):
 @router.callback_query(F.data.startswith("reward_"))
 async def handle_reward(callback: CallbackQuery):
     logger.info(f"Procesando recompensa para usuario {callback.from_user.id}")
+    await clean_old_messages(callback.message.chat.id)
     reward_id = int(callback.data.split("_")[1])
+    async with async_session() as session:
+        try:
+            reward = await session.get(Reward, reward_id)
+            user = await session.execute(select(User).filter_by(telegram_id=callback.from_user.id))
+            user = user.scalars().first()
+            if reward and user:
+                response = (
+                    f"🎁 **{reward.name}** ({reward.cost} pts)\n"
+                    f"Descripción: {reward.description}\n"
+                    f"Tus puntos: {user.points}\n"
+                )
+                if reward.stock > 0 and user.points >= reward.cost:
+                    response += "¡Puedes canjear esta recompensa! Confirma abajo."
+                    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+                        [InlineKeyboardButton(text="Confirmar Canje", callback_data=f"confirm_reward_{reward.id}")],
+                        [InlineKeyboardButton(text="Volver a Tienda", callback_data="menu_tienda")]
+                    ])
+                else:
+                    response += "No tienes suficientes puntos o la recompensa está agotada."
+                    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+                        [InlineKeyboardButton(text="Volver a Tienda", callback_data="menu_tienda")]
+                    ])
+                await callback.message.edit_text(response, reply_markup=keyboard)
+            else:
+                await callback.message.edit_text("Recompensa o usuario no encontrado.")
+            await callback.answer()
+        except Exception as e:
+            logger.error(f"Error en handle_reward: {e}")
+            await callback.message.edit_text("Ocurrió un error al mostrar la recompensa.")
+
+@router.callback_query(F.data.startswith("confirm_reward_"))
+async def handle_confirm_reward(callback: CallbackQuery):
+    logger.info(f"Procesando confirmación de recompensa para usuario {callback.from_user.id}")
+    await clean_old_messages(callback.message.chat.id)
+    reward_id = int(callback.data.split("_")[2])
     async with async_session() as session:
         try:
             reward = await session.get(Reward, reward_id)
@@ -308,21 +350,23 @@ async def handle_reward(callback: CallbackQuery):
                     user.points -= reward.cost
                     reward.stock -= 1
                     await session.commit()
-                    await callback.message.answer(f"¡Canjeaste {reward.name}!")
+                    await callback.message.edit_text(f"¡Canjeaste {reward.name}! Te contactaremos con los detalles.")
                 else:
-                    await callback.message.answer("No tienes suficientes puntos.")
+                    await callback.message.edit_text("No tienes suficientes puntos.")
             else:
-                await callback.message.answer("Recompensa no disponible.")
+                await callback.message.edit_text("Recompensa no disponible.")
             await callback.answer()
         except Exception as e:
-            logger.error(f"Error en handle_reward: {e}")
-            await callback.message.answer("Ocurrió un error al canjear la recompensa.")
+            logger.error(f"Error en handle_confirm_reward: {e}")
+            await callback.message.edit_text("Ocurrió un error al canjear la recompensa.")
 
 @router.message(F.text == "Ranking")
 @router.callback_query(F.data == "menu_ranking")
 async def show_ranking(message: Message | CallbackQuery):
     user_id = message.from_user.id if isinstance(message, Message) else message.from_user.id
+    chat_id = message.chat.id if isinstance(message, Message) else message.message.chat.id
     logger.info(f"Procesando Ranking para usuario {user_id}")
+    await clean_old_messages(chat_id)
     async with async_session() as session:
         try:
             users = await session.execute(select(User).order_by(User.points.desc()).limit(10))
@@ -330,9 +374,9 @@ async def show_ranking(message: Message | CallbackQuery):
             ranking_text = "🏆 Top 10 Jugadores:\n"
             for i, user in enumerate(users, 1):
                 display_name = user.username or str(user.telegram_id)
-                if user.telegram_id == user_id:  # Mostrar nombre completo para el usuario que ejecuta
+                if user.telegram_id == user_id:
                     name = f"@{display_name}"
-                else:  # Mostrar solo la primera letra para otros usuarios
+                else:
                     name = f"@{display_name[0]}..."
                 ranking_text += f"{i}. {name} - {user.points} pts (Nivel {user.level})\n"
             keyboard = InlineKeyboardMarkup(inline_keyboard=[
@@ -393,6 +437,7 @@ async def reset_season(message: Message):
 @router.callback_query(F.data == "back_to_menu")
 async def back_to_menu(callback: CallbackQuery):
     logger.info(f"Procesando back_to_menu para usuario {callback.from_user.id}")
+    await clean_old_messages(callback.message.chat.id)
     try:
         await callback.message.edit_text("Elige una opción:", reply_markup=inline_main_menu)
         await callback.answer()
@@ -401,7 +446,6 @@ async def back_to_menu(callback: CallbackQuery):
         await callback.message.answer("Ocurrió un error al volver al menú.")
         await callback.answer()
 
-# Publicar en el canal con botones inline
 @router.message(Command("publicar"))
 async def cmd_publish(message: Message):
     logger.info(f"Procesando /publicar para usuario {message.from_user.id}")
@@ -435,10 +479,10 @@ async def cmd_publish(message: Message):
             logger.error(f"Error en /publicar: {e}")
             await message.answer("Ocurrió un error al publicar.")
 
-# Manejar clics en botones inline de publicaciones
 @router.callback_query(F.data.startswith("post_"))
 async def handle_post_reaction(callback: CallbackQuery):
     logger.info(f"Procesando reacción a publicación para usuario {callback.from_user.id}")
+    await clean_old_messages(callback.message.chat.id)
     data = callback.data.split("_")
     mission_id = int(data[1])
     async with async_session() as session:
@@ -466,7 +510,6 @@ async def handle_post_reaction(callback: CallbackQuery):
             logger.error(f"Error en handle_post_reaction: {e}")
             await callback.message.answer("Ocurrió un error al registrar la reacción.")
 
-# Crear encuesta en el canal
 @router.message(Command("encuesta"))
 async def cmd_poll(message: Message):
     logger.info(f"Procesando /encuesta para usuario {message.from_user.id}")
@@ -497,8 +540,8 @@ async def cmd_poll(message: Message):
                 CHANNEL_ID,
                 question=question,
                 options=options,
-                is_anonymous=False,  # Necesario para detectar quién vota
-                type="quiz" if len(options) == 4 else "regular"  # Quiz si tiene 4 opciones
+                is_anonymous=False,
+                type="quiz" if len(options) == 4 else "regular"
             )
             mission.poll_id = poll.poll.id
             await session.commit()
@@ -507,7 +550,6 @@ async def cmd_poll(message: Message):
             logger.error(f"Error en /encuesta: {e}")
             await message.answer("Ocurrió un error al crear la encuesta.")
 
-# Manejar respuestas a encuestas
 @router.poll_answer()
 async def handle_poll_answer(poll_answer: PollAnswer):
     logger.info(f"Procesando respuesta a encuesta para usuario {poll_answer.user.id}")
@@ -536,7 +578,6 @@ async def handle_poll_answer(poll_answer: PollAnswer):
             logger.error(f"Error en handle_poll_answer: {e}")
             await bot.send_message(poll_answer.user.id, "Ocurrió un error al registrar tu respuesta.")
 
-# Inicialización y ejecución
 async def main():
     try:
         await init_db()
