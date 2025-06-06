@@ -448,4 +448,107 @@ async def cmd_poll(message: Message):
         return
     async with async_session() as session:
         try:
-    
+            mission = await session.get(Mission, mission_id)
+            user = await session.execute(select(User).filter_by(telegram_id=callback.from_user.id))
+            user = user.scalars().first()
+            if mission and user:
+                if mission_id not in user.completed_missions:
+                    user.points += mission.points
+                    user.completed_missions.append(mission_id)
+                    await award_achievement(user, "Primera Reacción", session)
+                    await session.commit()
+                    level_up = await check_level_up(user, session)
+                    msg = f"¡Reacción registrada! Ganaste {mission.points} puntos."
+                    if level_up:
+                        msg += f"\n¡Subiste al nivel {user.level}!"
+                    await callback.message.answer(msg)
+                else:
+                    await callback.message.answer("Ya reaccionaste a esta publicación.")
+            else:
+                await callback.message.answer("Publicación o usuario no encontrado.")
+            await callback.answer()
+        except Exception as e:
+            logger.error(f"Error en handle_post_reaction: {e}")
+            await callback.message.answer("Ocurrió un error al registrar la reacción.")
+
+# Crear encuesta en el canal
+@router.message(Command("encuesta"))
+async def cmd_poll(message: Message):
+    logger.info(f"Procesando /encuesta para usuario {message.from_user.id}")
+    if message.from_user.id != ADMIN_ID:
+        await message.answer("No tienes permisos.")
+        return
+    if len(message.text.split()) < 4:
+        await message.answer("Uso: /encuesta <pregunta> <opción1> <opción2> [opción3...]")
+        return
+    args = message.text.split()[1:]
+    question = args[0]
+    options = args[1:]
+    if len(options) < 2:
+        await message.answer("Debe incluir al menos dos opciones.")
+        return
+    async with async_session() as session:
+        try:
+            mission = Mission(
+                title=f"Encuesta: {question[:20]}...",
+                description=question,
+                points=10,
+                type="poll",
+                active=1
+            )
+            session.add(mission)
+            await session.commit()
+            poll = await bot.send_poll(
+                CHANNEL_ID,
+                question=question,
+                options=options,
+                is_anonymous=False,  # Necesario para detectar quién vota
+                type="quiz" if len(options) == 4 else "regular"  # Quiz si tiene 4 opciones
+            )
+            mission.poll_id = poll.poll.id
+            await session.commit()
+            await message.answer("Encuesta enviada al canal.")
+        except Exception as e:
+            logger.error(f"Error en /encuesta: {e}")
+            await message.answer("Ocurrió un error al crear la encuesta.")
+
+# Manejar respuestas a encuestas
+@router.poll_answer()
+async def handle_poll_answer(poll_answer: PollAnswer):
+    logger.info(f"Procesando respuesta a encuesta para usuario {poll_answer.user.id}")
+    async with async_session() as session:
+        try:
+            mission = await session.execute(select(Mission).filter_by(poll_id=poll_answer.poll_id))
+            mission = mission.scalars().first()
+            user = await session.execute(select(User).filter_by(telegram_id=poll_answer.user.id))
+            user = user.scalars().first()
+            if mission and user:
+                if mission.id not in user.completed_missions:
+                    user.points += mission.points
+                    user.completed_missions.append(mission.id)
+                    await award_achievement(user, "Primera Encuesta", session)
+                    await session.commit()
+                    level_up = await check_level_up(user, session)
+                    msg = f"¡Encuesta completada! Ganaste {mission.points} puntos."
+                    if level_up:
+                        msg += f"\n¡Subiste al nivel {user.level}!"
+                    await bot.send_message(poll_answer.user.id, msg)
+                else:
+                    await bot.send_message(poll_answer.user.id, "Ya participaste en esta encuesta.")
+            else:
+                await bot.send_message(poll_answer.user.id, "Encuesta o usuario no encontrado.")
+        except Exception as e:
+            logger.error(f"Error en handle_poll_answer: {e}")
+            await bot.send_message(poll_answer.user.id, "Ocurrió un error al registrar tu respuesta.")
+
+# Inicialización y ejecución
+async def main():
+    try:
+        await init_db()
+        dp.include_router(router)
+        await dp.start_polling(bot)
+    except Exception as e:
+        logger.error(f"Error en main: {e}")
+
+if __name__ == "__main__":
+    asyncio.run(main())
