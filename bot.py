@@ -66,6 +66,7 @@ engine = create_async_engine(DATABASE_URL, echo=False)
 async_session = sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
 
 async def init_db():
+async def init_db():
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
     async with async_session() as session:
@@ -90,6 +91,19 @@ async def init_db():
 async def get_db():
     async with async_session() as session:
         yield session
+
+# Función auxiliar para limpiar mensajes antiguos
+async def clean_old_messages(chat_id: int):
+    try:
+        # Intentar eliminar los últimos 50 mensajes del bot
+        for message_id in range(1, 1000):  # Rango amplio para buscar mensajes
+            try:
+                await bot.delete_message(chat_id=chat_id, message_id=message_id)
+            except Exception:
+                continue  # Ignorar mensajes que no existen o no se pueden eliminar
+    except Exception as e:
+        logger.debug(f"No se pudieron eliminar mensajes antiguos: {e}")
+
 
 # Lógica de gamificación
 async def award_points(user: User, points: int, session: AsyncSession):
