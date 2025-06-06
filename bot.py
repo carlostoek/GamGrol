@@ -58,7 +58,7 @@ class Reward(Base):
     stock = Column(Integer, default=1)
 
 # Configuración de la base de datos
-engine = create_async_engine(DATABASE_URL, echo=False)  # Desactivar logs SQL
+engine = create_async_engine(DATABASE_URL, echo=False)
 async_session = sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
 
 async def init_db():
@@ -85,13 +85,7 @@ async def init_db():
 
 async def get_db():
     async with async_session() as session:
-        try:
-            yield session
-            await session.commit()
-        except Exception as e:
-            logger.error(f"Error en la base de datos: {e}")
-            await session.rollback()
-            raise
+        yield session
 
 # Lógica de gamificación
 async def award_points(user: User, points: int, session: AsyncSession):
@@ -128,7 +122,7 @@ main_menu = ReplyKeyboardMarkup(
 @router.message(Command("start"))
 async def cmd_start(message: Message):
     logger.info(f"Procesando /start para usuario {message.from_user.id}")
-    async for session in get_db():
+    async with async_session() as session:
         try:
             user = await session.get(User, message.from_user.id)
             if not user:
@@ -142,105 +136,137 @@ async def cmd_start(message: Message):
             )
         except Exception as e:
             logger.error(f"Error en /start: {e}")
-            await message.answer("Ocurrió un error. Intenta de nuevo.")
+            await message.answer("Ocurrió un error al iniciar. Intenta de nuevo.")
 
 @router.message(F.text == "Perfil")
 async def cmd_profile(message: Message):
     logger.info(f"Procesando Perfil para usuario {message.from_user.id}")
-    async for session in get_db():
-        user = await session.get(User, message.from_user.id)
-        if user:
-            profile_text = (
-                f"👤 Perfil de @{user.username or user.telegram_id}\n"
-                f"📊 Puntos: {user.points}\n"
-                f"🏆 Nivel: {user.level}\n"
-                f"🎖 Logros: {', '.join(user.achievements) or 'Ninguno'}"
-            )
-            keyboard = InlineKeyboardMarkup(inline_keyboard=[
-                [InlineKeyboardButton(text="Volver al Menú", callback_data="back_to_menu")]
-            ])
-            await message.answer(profile_text, reply_markup=keyboard)
-        else:
-            await message.answer("Por favor, usa /start primero.")
+    async with async_session() as session:
+        try:
+            user = await session.get(User, message.from_user.id)
+            if user:
+                profile_text = (
+                    f"👤 Perfil de @{user.username or user.telegram_id}\n"
+                    f"📊 Puntos: {user.points}\n"
+                    f"🏆 Nivel: {user.level}\n"
+                    f"🎖 Logros: {', '.join(user.achievements) or 'Ninguno'}"
+                )
+                keyboard = InlineKeyboardMarkup(inline_keyboard=[
+                    [InlineKeyboardButton(text="Volver al Menú", callback_data="back_to_menu")]
+                ])
+                await message.answer(profile_text, reply_markup=keyboard)
+            else:
+                await message.answer("Por favor, usa /start primero.")
+        except Exception as e:
+            logger.error(f"Error en Perfil: {e}")
+            await message.answer("Ocurrió un error al mostrar el perfil.")
 
 @router.message(F.text == "Misiones")
 async def show_missions(message: Message):
     logger.info(f"Procesando Misiones para usuario {message.from_user.id}")
-    async for session in get_db():
-        missions = await session.execute(select(Mission).filter_by(active=1))
-        missions = missions.scalars().all()
-        keyboard = InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text=mission.title, callback_data=f"mission_{mission.id}")]
-            for mission in missions
-        ])
-        await message.answer("Misiones disponibles:", reply_markup=keyboard)
+    async with async_session() as session:
+        try:
+            missions = await session.execute(select(Mission).filter_by(active=1))
+            missions = missions.scalars().all()
+            if not missions:
+                await message.answer("No hay misiones disponibles.")
+                return
+            keyboard = InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text=mission.title, callback_data=f"mission_{mission.id}")]
+                for mission in missions
+            ])
+            await message.answer("Misiones disponibles:", reply_markup=keyboard)
+        except Exception as e:
+            logger.error(f"Error en Misiones: {e}")
+            await message.answer("Ocurrió un error al mostrar misiones.")
 
 @router.callback_query(F.data.startswith("mission_"))
 async def handle_mission(callback: CallbackQuery):
     logger.info(f"Procesando misión para usuario {callback.from_user.id}")
     mission_id = int(callback.data.split("_")[1])
-    async for session in get_db():
-        mission = await session.get(Mission, mission_id)
-        user = await session.get(User, callback.from_user.id)
-        if mission and user:
-            if mission_id not in user.completed_missions:
-                user.points += mission.points
-                user.completed_missions.append(mission_id)
-                await award_achievement(user, "Primera Misión Completada", session)
-                await session.commit()
-                level_up = await check_level_up(user, session)
-                msg = f"¡Misión completada! Ganaste {mission.points} puntos."
-                if level_up:
-                    msg += f"\n¡Subiste al nivel {user.level}!"
-                await callback.message.answer(msg)
+    async with async_session() as session:
+        try:
+            mission = await session.get(Mission, mission_id)
+            user = await session.get(User, callback.from_user.id)
+            if mission and user:
+                if mission_id not in user.completed_missions:
+                    user.points += mission.points
+                    user.completed_missions.append(mission_id)
+                    await award_achievement(user, "Primera Misión Completada", session)
+                    await session.commit()
+                    level_up = await check_level_up(user, session)
+                    msg = f"¡Misión completada! Ganaste {mission.points} puntos."
+                    if level_up:
+                        msg += f"\n¡Subiste al nivel {user.level}!"
+                    await callback.message.answer(msg)
+                else:
+                    await callback.message.answer("Ya completaste esta misión.")
             else:
-                await callback.message.answer("Ya completaste esta misión.")
-        await callback.answer()
+                await callback.message.answer("Misión o usuario no encontrado.")
+            await callback.answer()
+        except Exception as e:
+            logger.error(f"Error en handle_mission: {e}")
+            await callback.message.answer("Ocurrió un error al completar la misión.")
 
 @router.message(F.text == "Tienda")
 async def show_store(message: Message):
     logger.info(f"Procesando Tienda para usuario {message.from_user.id}")
-    async for session in get_db():
-        rewards = await session.execute(select(Reward).filter(Reward.stock > 0))
-        rewards = rewards.scalars().all()
-        keyboard = InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text=f"{r.name} ({r.cost} pts)", callback_data=f"reward_{r.id}")]
-            for r in rewards
-        ])
-        await message.answer("Tienda de recompensas:", reply_markup=keyboard)
+    async with async_session() as session:
+        try:
+            rewards = await session.execute(select(Reward).filter(Reward.stock > 0))
+            rewards = rewards.scalars().all()
+            if not rewards:
+                await message.answer("No hay recompensas disponibles.")
+                return
+            keyboard = InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text=f"{r.name} ({r.cost} pts)", callback_data=f"reward_{r.id}")]
+                for r in rewards
+            ])
+            await message.answer("Tienda de recompensas:", reply_markup=keyboard)
+        except Exception as e:
+            logger.error(f"Error en Tienda: {e}")
+            await message.answer("Ocurrió un error al mostrar la tienda.")
 
 @router.callback_query(F.data.startswith("reward_"))
 async def handle_reward(callback: CallbackQuery):
     logger.info(f"Procesando recompensa para usuario {callback.from_user.id}")
     reward_id = int(callback.data.split("_")[1])
-    async for session in get_db():
-        reward = await session.get(Reward, reward_id)
-        user = await session.get(User, callback.from_user.id)
-        if reward and user and reward.stock > 0:
-            if user.points >= reward.cost:
-                user.points -= reward.cost
-                reward.stock -= 1
-                await session.commit()
-                await callback.message.answer(f"¡Canjeaste {reward.name}!")
+    async with async_session() as session:
+        try:
+            reward = await session.get(Reward, reward_id)
+            user = await session.get(User, callback.from_user.id)
+            if reward and user and reward.stock > 0:
+                if user.points >= reward.cost:
+                    user.points -= reward.cost
+                    reward.stock -= 1
+                    await session.commit()
+                    await callback.message.answer(f"¡Canjeaste {reward.name}!")
+                else:
+                    await callback.message.answer("No tienes suficientes puntos.")
             else:
-                await callback.message.answer("No tienes suficientes puntos.")
-        else:
-            await callback.message.answer("Recompensa no disponible.")
-        await callback.answer()
+                await callback.message.answer("Recompensa no disponible.")
+            await callback.answer()
+        except Exception as e:
+            logger.error(f"Error en handle_reward: {e}")
+            await callback.message.answer("Ocurrió un error al canjear la recompensa.")
 
 @router.message(F.text == "Ranking")
 async def show_ranking(message: Message):
     logger.info(f"Procesando Ranking para usuario {message.from_user.id}")
-    async for session in get_db():
-        users = await session.execute(select(User).order_by(User.points.desc()).limit(10))
-        users = users.scalars().all()
-        ranking_text = "🏆 Top 10 Jugadores:\n"
-        for i, user in enumerate(users, 1):
-            ranking_text += f"{i}. @{user.username or user.telegram_id} - {user.points} pts (Nivel {user.level})\n"
-        keyboard = InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="Volver al Menú", callback_data="back_to_menu")]
-        ])
-        await message.answer(ranking_text, reply_markup=keyboard)
+    async with async_session() as session:
+        try:
+            users = await session.execute(select(User).order_by(User.points.desc()).limit(10))
+            users = users.scalars().all()
+            ranking_text = "🏆 Top 10 Jugadores:\n"
+            for i, user in enumerate(users, 1):
+                ranking_text += f"{i}. @{user.username or user.telegram_id} - {user.points} pts (Nivel {user.level})\n"
+            keyboard = InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="Volver al Menú", callback_data="back_to_menu")]
+            ])
+            await message.answer(ranking_text, reply_markup=keyboard)
+        except Exception as e:
+            logger.error(f"Error en Ranking: {e}")
+            await message.answer("Ocurrió un error al mostrar el ranking.")
 
 @router.message(Command("exportar"))
 async def export_data(message: Message):
@@ -248,18 +274,22 @@ async def export_data(message: Message):
     if message.from_user.id != ADMIN_ID:
         await message.answer("No tienes permisos.")
         return
-    async for session in get_db():
-        users = await session.execute(select(User))
-        users = users.scalars().all()
-        output = io.StringIO()
-        writer = csv.writer(output)
-        writer.writerow(["telegram_id", "username", "points", "level", "achievements"])
-        for user in users:
-            writer.writerow([user.telegram_id, user.username, user.points, user.level, user.achievements])
-        await message.answer_document(
-            document=io.BytesIO(output.getvalue().encode()),
-            filename="users_export.csv"
-        )
+    async with async_session() as session:
+        try:
+            users = await session.execute(select(User))
+            users = users.scalars().all()
+            output = io.StringIO()
+            writer = csv.writer(output)
+            writer.writerow(["telegram_id", "username", "points", "level", "achievements"])
+            for user in users:
+                writer.writerow([user.telegram_id, user.username, user.points, user.level, user.achievements])
+            await message.answer_document(
+                document=io.BytesIO(output.getvalue().encode()),
+                filename="users_export.csv"
+            )
+        except Exception as e:
+            logger.error(f"Error en exportar: {e}")
+            await message.answer("Ocurrió un error al exportar datos.")
 
 @router.message(Command("resetear"))
 async def reset_season(message: Message):
@@ -267,22 +297,33 @@ async def reset_season(message: Message):
     if message.from_user.id != ADMIN_ID:
         await message.answer("No tienes permisos.")
         return
-    async for session in get_db():
-        await session.execute("UPDATE users SET points = 0, level = 1, achievements = '[]', completed_missions = '[]'")
-        await session.commit()
-        await message.answer("Temporada reseteada.")
+    async with async_session() as session:
+        try:
+            await session.execute("UPDATE users SET points = 0, level = 1, achievements = '[]', completed_missions = '[]'")
+            await session.commit()
+            await message.answer("Temporada reseteada.")
+        except Exception as e:
+            logger.error(f"Error en resetear: {e}")
+            await message.answer("Ocurrió un error al resetear la temporada.")
 
 @router.callback_query(F.data == "back_to_menu")
 async def back_to_menu(callback: CallbackQuery):
     logger.info(f"Procesando back_to_menu para usuario {callback.from_user.id}")
-    await callback.message.edit_text("Vuelve al menú:", reply_markup=main_menu)
-    await callback.answer()
+    try:
+        await callback.message.edit_text("Vuelve al menú:", reply_markup=main_menu)
+        await callback.answer()
+    except Exception as e:
+        logger.error(f"Error en back_to_menu: {e}")
+        await callback.message.answer("Ocurrió un error al volver al menú.")
 
 # Inicialización y ejecución
 async def main():
-    await init_db()
-    dp.include_router(router)
-    await dp.start_polling(bot)
+    try:
+        await init_db()
+        dp.include_router(router)
+        await dp.start_polling(bot)
+    except Exception as e:
+        logger.error(f"Error en main: {e}")
 
 if __name__ == "__main__":
     asyncio.run(main())
