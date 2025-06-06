@@ -11,6 +11,7 @@ from dotenv import load_dotenv
 from sqlalchemy import Column, Integer, String, JSON, select
 from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession
 from sqlalchemy.orm import declarative_base, sessionmaker
+from sqlalchemy.exc import IntegrityError
 
 # Configuración de logging
 logging.basicConfig(level=logging.INFO)
@@ -124,7 +125,9 @@ async def cmd_start(message: Message):
     logger.info(f"Procesando /start para usuario {message.from_user.id}")
     async with async_session() as session:
         try:
-            user = await session.get(User, message.from_user.id)
+            # Verificar si el usuario ya existe
+            user = await session.execute(select(User).filter_by(telegram_id=message.from_user.id))
+            user = user.scalars().first()
             if not user:
                 user = User(telegram_id=message.from_user.id, username=message.from_user.username)
                 session.add(user)
@@ -132,6 +135,12 @@ async def cmd_start(message: Message):
                 logger.info(f"Usuario {message.from_user.id} creado")
             await message.answer(
                 "¡Bienvenido al bot gamificado! 🎮\nUsa el menú para navegar.",
+                reply_markup=main_menu
+            )
+        except IntegrityError:
+            # Ignorar error si el usuario ya existe
+            await message.answer(
+                "¡Ya estás registrado! Usa el menú para navegar.",
                 reply_markup=main_menu
             )
         except Exception as e:
@@ -143,7 +152,8 @@ async def cmd_profile(message: Message):
     logger.info(f"Procesando Perfil para usuario {message.from_user.id}")
     async with async_session() as session:
         try:
-            user = await session.get(User, message.from_user.id)
+            user = await session.execute(select(User).filter_by(telegram_id=message.from_user.id))
+            user = user.scalars().first()
             if user:
                 profile_text = (
                     f"👤 Perfil de @{user.username or user.telegram_id}\n"
@@ -187,7 +197,8 @@ async def handle_mission(callback: CallbackQuery):
     async with async_session() as session:
         try:
             mission = await session.get(Mission, mission_id)
-            user = await session.get(User, callback.from_user.id)
+            user = await session.execute(select(User).filter_by(telegram_id=callback.from_user.id))
+            user = user.scalars().first()
             if mission and user:
                 if mission_id not in user.completed_missions:
                     user.points += mission.points
@@ -234,7 +245,8 @@ async def handle_reward(callback: CallbackQuery):
     async with async_session() as session:
         try:
             reward = await session.get(Reward, reward_id)
-            user = await session.get(User, callback.from_user.id)
+            user = await session.execute(select(User).filter_by(telegram_id=callback.from_user.id))
+            user = user.scalars().first()
             if reward and user and reward.stock > 0:
                 if user.points >= reward.cost:
                     user.points -= reward.cost
