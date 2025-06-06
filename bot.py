@@ -70,8 +70,16 @@ async def init_db():
         await conn.run_sync(Base.metadata.create_all)
     async with async_session() as session:
         rewards = [
-            Reward(name="Sticker Exclusivo", description="Un sticker único", cost=20, stock=10),
-            Reward(name="Rol VIP", description="Acceso a canal VIP", cost=50, stock=5)
+            Reward(name="Besito Digital", description="Un saludo personalizado, coqueto y tierno, exclusivo para ti.", cost=20, stock=5),
+            Reward(name="Espía del Diván", description="Accede de forma anticipada a una publicación futura antes que nadie.", cost=30, stock=5),
+            Reward(name="Toque Kinky", description="Un descuento sorpresa para usar en contenido exclusivo o sesiones.", cost=40, stock=5),
+            Reward(name="Spoiler Indiscreto", description="Obtén una pista visual o textual de un futuro set antes del lanzamiento.", cost=50, stock=5),
+            Reward(name="Entrada Furtiva al Diván", description="Acceso por 24 horas al canal VIP para quienes no están suscritos actualmente (o para regalar).", cost=60, stock=5),
+            Reward(name="Confesión Prohibida", description="Diana responderá en privado una pregunta que elijas… sin filtros.", cost=70, stock=5),
+            Reward(name="La Llave del Cajón Secreto", description="Acceso a una pieza de contenido 'perdido' que no está publicado en el canal.", cost=80, stock=5),
+            Reward(name="Ritual de Medianoche", description="Un contenido especial que solo se entrega entre las 12:00 y la 1:00 AM. Misterioso y provocador.", cost=90, stock=5),
+            Reward(name="Premonición Sensual", description="Recibe una visión anticipada de una sesión o colaboración futura, en forma de teaser o audio.", cost=100, stock=5),
+            Reward(name="Capricho Premium", description="Canjeable por un video Premium completo a elección del catálogo (con restricciones de disponibilidad).", cost=150, stock=5)
         ]
         for reward in rewards:
             existing = await session.execute(select(Reward).filter_by(name=reward.name))
