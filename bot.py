@@ -70,8 +70,16 @@ async def init_db():
         await conn.run_sync(Base.metadata.create_all)
     async with async_session() as session:
         rewards = [
-            Reward(name="Sticker Exclusivo", description="Un sticker único", cost=20, stock=10),
-            Reward(name="Rol VIP", description="Acceso a canal VIP", cost=50, stock=5)
+            Reward(name="Besito Digital", description="Un saludo personalizado, coqueto y tierno, exclusivo para ti.", cost=20, stock=5),
+            Reward(name="Espía del Diván", description="Accede de forma anticipada a una publicación futura antes que nadie.", cost=30, stock=5),
+            Reward(name="Toque Kinky", description="Un descuento sorpresa para usar en contenido exclusivo o sesiones.", cost=40, stock=5),
+            Reward(name="Spoiler Indiscreto", description="Obtén una pista visual o textual de un futuro set antes del lanzamiento.", cost=50, stock=5),
+            Reward(name="Entrada Furtiva al Diván", description="Acceso por 24 horas al canal VIP para quienes no están suscritos actualmente (o para regalar).", cost=60, stock=5),
+            Reward(name="Confesión Prohibida", description="Diana responderá en privado una pregunta que elijas… sin filtros.", cost=70, stock=5),
+            Reward(name="La Llave del Cajón Secreto", description="Acceso a una pieza de contenido 'perdido' que no está publicado en el canal.", cost=80, stock=5),
+            Reward(name="Ritual de Medianoche", description="Un contenido especial que solo se entrega entre las 12:00 y la 1:00 AM. Misterioso y provocador.", cost=90, stock=5),
+            Reward(name="Premonición Sensual", description="Recibe una visión anticipada de una sesión o colaboración futura, en forma de teaser o audio.", cost=100, stock=5),
+            Reward(name="Capricho Premium", description="Canjeable por un video Premium completo a elección del catálogo (con restricciones de disponibilidad).", cost=150, stock=5)
         ]
         for reward in rewards:
             existing = await session.execute(select(Reward).filter_by(name=reward.name))
@@ -197,22 +205,21 @@ async def show_missions(message: Message | CallbackQuery):
         try:
             missions = await session.execute(select(Mission).filter_by(active=1))
             missions = missions.scalars().all()
+            response = "Misiones disponibles:\n"
             if not missions:
-                response = "No hay misiones disponibles. ¡Participa en las publicaciones y encuestas del canal!"
-                if isinstance(message, Message):
-                    await message.answer(response)
-                else:
-                    await message.message.edit_text(response)
-                    await message.answer()
-                return
+                response += "No hay misiones activas en el canal. ¡Prueba esta misión temporal!\n"
+            else:
+                for mission in missions:
+                    response += f"- {mission.title}: {mission.points} puntos\n"
+            # Botón temporal "Pruébame para sumar puntos"
             keyboard = InlineKeyboardMarkup(inline_keyboard=[
-                [InlineKeyboardButton(text=mission.title, callback_data=f"mission_{mission.id}")]
-                for mission in missions
+                [InlineKeyboardButton(text="Pruébame para sumar puntos", callback_data="test_points")],
+                [InlineKeyboardButton(text="Volver al Menú", callback_data="back_to_menu")]
             ])
             if isinstance(message, Message):
-                await message.answer("Misiones disponibles:", reply_markup=keyboard)
+                await message.answer(response, reply_markup=keyboard)
             else:
-                await message.message.edit_text("Misiones disponibles:", reply_markup=keyboard)
+                await message.message.edit_text(response, reply_markup=keyboard)
                 await message.answer()
         except Exception as e:
             logger.error(f"Error en Misiones: {e}")
@@ -222,6 +229,35 @@ async def show_missions(message: Message | CallbackQuery):
             else:
                 await message.message.answer(response)
                 await message.answer()
+
+# Manejador para el botón temporal "Pruébame para sumar puntos"
+@router.callback_query(F.data == "test_points")
+async def handle_test_points(callback: CallbackQuery):
+    logger.info(f"Procesando botón de prueba para usuario {callback.from_user.id}")
+    async with async_session() as session:
+        try:
+            user = await session.execute(select(User).filter_by(telegram_id=callback.from_user.id))
+            user = user.scalars().first()
+            if user:
+                # Usamos un identificador único para la misión de prueba
+                test_mission_id = "test_mission"
+                if test_mission_id not in user.completed_missions:
+                    user.points += 5  # Otorga 5 puntos
+                    user.completed_missions.append(test_mission_id)
+                    await session.commit()
+                    level_up = await check_level_up(user, session)
+                    msg = "¡Prueba exitosa! Ganaste 5 puntos."
+                    if level_up:
+                        msg += f"\n¡Subiste al nivel {user.level}!"
+                    await callback.message.answer(msg)
+                else:
+                    await callback.message.answer("Ya probaste esta misión.")
+            else:
+                await callback.message.answer("Usuario no encontrado. Usa /start primero.")
+            await callback.answer()
+        except Exception as e:
+            logger.error(f"Error en handle_test_points: {e}")
+            await callback.message.answer("Ocurrió un error al procesar la misión de prueba.")
 
 @router.message(F.text == "Tienda")
 @router.callback_query(F.data == "menu_tienda")
@@ -405,47 +441,6 @@ async def handle_post_reaction(callback: CallbackQuery):
     logger.info(f"Procesando reacción a publicación para usuario {callback.from_user.id}")
     data = callback.data.split("_")
     mission_id = int(data[1])
-    async with async_session() as session:
-        try:
-            mission = await session.get(Mission, mission_id)
-            user = await session.execute(select(User).filter_by(telegram_id=callback.from_user.id))
-            user = user.scalars().first()
-            if mission and user:
-                if mission_id not in user.completed_missions:
-                    user.points += mission.points
-                    user.completed_missions.append(mission_id)
-                    await award_achievement(user, "Primera Reacción", session)
-                    await session.commit()
-                    level_up = await check_level_up(user, session)
-                    msg = f"¡Reacción registrada! Ganaste {mission.points} puntos."
-                    if level_up:
-                        msg += f"\n¡Subiste al nivel {user.level}!"
-                    await callback.message.answer(msg)
-                else:
-                    await callback.message.answer("Ya reaccionaste a esta publicación.")
-            else:
-                await callback.message.answer("Publicación o usuario no encontrado.")
-            await callback.answer()
-        except Exception as e:
-            logger.error(f"Error en handle_post_reaction: {e}")
-            await callback.message.answer("Ocurrió un error al registrar la reacción.")
-
-# Crear encuesta en el canal
-@router.message(Command("encuesta"))
-async def cmd_poll(message: Message):
-    logger.info(f"Procesando /encuesta para usuario {message.from_user.id}")
-    if message.from_user.id != ADMIN_ID:
-        await message.answer("No tienes permisos.")
-        return
-    if len(message.text.split()) < 4:
-        await message.answer("Uso: /encuesta <pregunta> <opción1> <opción2> [opción3...]")
-        return
-    args = message.text.split()[1:]
-    question = args[0]
-    options = args[1:]
-    if len(options) < 2:
-        await message.answer("Debe incluir al menos dos opciones.")
-        return
     async with async_session() as session:
         try:
             mission = await session.get(Mission, mission_id)
